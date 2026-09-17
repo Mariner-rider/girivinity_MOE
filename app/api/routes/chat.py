@@ -47,6 +47,7 @@ async def chat_message(req: ChatRequest):
         context=context,
         urls=urls,
         stream=False,
+        web_sources=result.get("chunks", []),
     )
     if not isinstance(answer, str):
         answer = "".join(answer)
@@ -92,6 +93,7 @@ async def chat_message_stream(req: ChatRequest):
             context=context,
             urls=urls,
             stream=True,
+            web_sources=result.get("chunks", []),
         )
         if isinstance(result, str):
             for word in result.split(" "):

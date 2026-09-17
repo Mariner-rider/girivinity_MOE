@@ -94,51 +94,52 @@ few months automatically.
 ---
 
 ## System Architecture
+
 User Query
 │
 ▼
 ┌─────────────────────────────────────┐
-│           QueryRouter               │
-│  Embeds query → searches ChromaDB   │
-│  Score ≥ 0.72 → Knowledge Base hit  │
-│  Score < 0.72 → Web search          │
+│ QueryRouter │
+│ Embeds query → searches ChromaDB │
+│ Score ≥ 0.72 → Knowledge Base hit │
+│ Score < 0.72 → Web search │
 └──────────┬──────────────┬───────────┘
-│              │
-KB Hit │              │ KB Miss
-│              ▼
-│   ┌─────────────────────┐
-│   │   WebIntelligence   │
-│   │  DuckDuckGo search  │
-│   │  httpx fetch        │
-│   │  trafilatura clean  │
-│   │  chunk + score      │
-│   └────────┬────────────┘
-│            │
-│            ├──────────────────────────────────┐
-│            │                                  │
-│            ▼                                  ▼
-│   Returns top 3 chunks            Background daemon thread
-│                                   SelfTrainer.queue()
-│                                   → SQLite pending_training
-│                                   → Every 30min: LoRA update
+│ │
+KB Hit │ │ KB Miss
+│ ▼
+│ ┌─────────────────────┐
+│ │ WebIntelligence │
+│ │ DuckDuckGo search │
+│ │ httpx fetch │
+│ │ trafilatura clean │
+│ │ chunk + score │
+│ └────────┬────────────┘
+│ │
+│ ├──────────────────────────────────┐
+│ │ │
+│ ▼ ▼
+│ Returns top 3 chunks Background daemon thread
+│ SelfTrainer.queue()
+│ → SQLite pending_training
+│ → Every 30min: LoRA update
 ▼
 ┌─────────────────────────────────────┐
-│          LLMSynthesiser             │
-│  Builds prompt: system + context    │
-│  Calls GirivinityEngine.generate()  │
-│  Fallback to extraction if no model │
+│ LLMSynthesiser │
+│ Builds prompt: system + context │
+│ Calls GirivinityEngine.generate() │
+│ Fallback to extraction if no model │
 └──────────┬──────────────────────────┘
 │
 ▼
 ┌─────────────────────────────────────┐
-│           TruthEngine               │
-│  Extracts factual claims            │
-│  Verifies each claim vs ChromaDB    │
-│  Labels: KB_SOURCED / WEB_SOURCED   │
-│          / UNVERIFIED               │
-│  Adds disclaimer if >30% unverified │
-│  Appends real citations only        │
-│  Scores confidence 0.0–1.0          │
+│ TruthEngine │
+│ Extracts factual claims │
+│ Verifies each claim vs ChromaDB │
+│ Labels: KB_SOURCED / WEB_SOURCED │
+│ / UNVERIFIED │
+│ Adds disclaimer if >30% unverified │
+│ Appends real citations only │
+│ Scores confidence 0.0–1.0 │
 └──────────┬──────────────────────────┘
 │
 ▼
@@ -189,10 +190,10 @@ retrains from scratch — a completely new generation.
 
 The **SuccessorEngine** daemon checks two triggers every 24 hours:
 
-| Trigger | Condition | Meaning |
-|---------|-----------|---------|
-| Knowledge growth | trained chunks ≥ 100,000 | Enough new knowledge for a fundamentally better model |
-| Quality degradation | rolling avg feedback < 3.5/5.0 | Users rating answers poorly |
+| Trigger             | Condition                      | Meaning                                               |
+| ------------------- | ------------------------------ | ----------------------------------------------------- |
+| Knowledge growth    | trained chunks ≥ 100,000       | Enough new knowledge for a fundamentally better model |
+| Quality degradation | rolling avg feedback < 3.5/5.0 | Users rating answers poorly                           |
 
 When either triggers:
 
@@ -215,16 +216,15 @@ The improvement percentage is included in the notification.
 
 ---
 
-
 ## Model Generation Roadmap
 
-| Generation | Model | Target Parameters | Architecture Direction |
-|---|---|---:|---|
-| 1 | Girivinity-3B | 3B | First production-scale native Girivinity generation |
-| 2 | Girivinity-7B | 7B | Larger general-purpose model with stronger reasoning |
-| 3 | Girivinity-13B | 13B | Higher-capacity reasoning and multilingual depth |
-| 4 | Girivinity-34B | 34B | Large-scale expert generation for complex domains |
-| 5 | Girivinity-70B | 70B | Last explicitly defined, hand-tuned generation |
+| Generation | Model          | Target Parameters | Architecture Direction                               |
+| ---------- | -------------- | ----------------: | ---------------------------------------------------- |
+| 1          | Girivinity-3B  |                3B | First production-scale native Girivinity generation  |
+| 2          | Girivinity-7B  |                7B | Larger general-purpose model with stronger reasoning |
+| 3          | Girivinity-13B |               13B | Higher-capacity reasoning and multilingual depth     |
+| 4          | Girivinity-34B |               34B | Large-scale expert generation for complex domains    |
+| 5          | Girivinity-70B |               70B | Last explicitly defined, hand-tuned generation       |
 
 ### The Roadmap Never Ends
 
@@ -469,6 +469,7 @@ girivinity/
 ## Component Reference
 
 ### QueryRouter — `app/core/query_router.py`
+
 The brain of every request. Embeds the query using
 `all-MiniLM-L6-v2`, searches ChromaDB with cosine similarity.
 Score ≥ 0.72 returns knowledge base chunks immediately.
@@ -476,6 +477,7 @@ Score < 0.72 delegates to WebIntelligence and fires self-training
 in a background thread. Never blocks the response.
 
 ### WebIntelligence — `app/core/web_intelligence.py`
+
 Searches DuckDuckGo (no API key needed), fetches top 5 URLs
 via httpx, extracts clean article text via trafilatura,
 chunks to 400 tokens with 50-token overlap, scores each chunk
@@ -483,6 +485,7 @@ for relevance to the original query, stores qualifying chunks
 in the ChromaDB `pending_training` collection.
 
 ### SelfTrainer — `app/core/self_trainer.py`
+
 Runs as a `multiprocessing.Process` daemon started at FastAPI
 startup. Checks the SQLite queue every 30 minutes. When ≥50
 pending chunks exist, formats them as instruction pairs,
@@ -491,6 +494,7 @@ new adapter, updates the `latest` symlink.
 Aborts training if loss exceeds threshold and alerts admin.
 
 ### LLMSynthesiser — `app/core/llm_synthesiser.py`
+
 Wraps the GirivinityEngine to produce natural language answers
 from retrieved context. Uses a system prompt that constrains
 the model to only use provided context — reducing hallucination
@@ -499,6 +503,7 @@ Falls back to structured extraction if the model is not yet built.
 Streaming responses append sources inline as they yield.
 
 ### TruthEngine — `app/core/truth_engine.py`
+
 Post-generation verification layer. Splits every response into
 individual factual claims, verifies each against ChromaDB
 (similarity ≥ 0.70 = KB_SOURCED), checks against web sources
@@ -508,6 +513,7 @@ Only appends citations for URLs that actually exist in the
 current session's retrieved data — never fabricates sources.
 
 ### SuccessorEngine — `app/core/successor_engine.py`
+
 24-hour daemon. Monitors two triggers: knowledge base chunk
 count and rolling average feedback score. When triggered,
 exports full training corpus, retrains GirivinityModel from
@@ -516,6 +522,7 @@ if the new model is better. Admin approves via API — the engine
 never auto-deploys.
 
 ### GirivinityModel — `model/architecture.py`
+
 Custom decoder-only transformer. PyTorch only — no HuggingFace.
 Components: RMSNorm, RoPE (with optional linear-scaling context
 extension via `rope_scaling_factor`), Grouped Query Attention (24 heads,
@@ -537,6 +544,7 @@ Deployment Guide Step 7.**
 ### Chat
 
 **POST /chat/message**
+
 ```json
 Request:  { "query": "string", "user_id": "string", "stream": false }
 Response: { "answer": "string", "source": "knowledge_base|web|none",
@@ -544,12 +552,13 @@ Response: { "answer": "string", "source": "knowledge_base|web|none",
 ```
 
 **POST /chat/message/stream**
-Request:  { "query": "string", "user_id": "string" }
+Request: { "query": "string", "user_id": "string" }
 Response: text/plain streaming — tokens arrive as they are generated
 
 ### Admin
 
 **GET /admin/notifications**
+
 ```json
 Response: { "notifications": [
   { "type": "successor_ready", "version": "20240101_120000",
@@ -561,21 +570,25 @@ Response: { "notifications": [
 ```
 
 **POST /admin/approve-successor/{version}**
+
 ```json
 Response: { "status": "approved", "version": "20240101_120000" }
 ```
 
 **POST /admin/reject-successor/{version}**
+
 ```json
 Response: { "status": "rejected", "version": "20240101_120000" }
 ```
 
 **GET /admin/model-versions**
+
 ```json
 Response: { "versions": ["20240201_080000", "20240101_120000"] }
 ```
 
 **POST /admin/feedback**
+
 ```json
 Request:  { "user_id": "string", "score": 1.0-5.0 }
 Response: { "status": "recorded" }
@@ -593,28 +606,29 @@ Response: { "status": "recorded" }
 
 ### Requirements
 
-| Resource | Minimum (CPU mode) | Recommended (GPU mode) |
-|---|---|---|
-| RAM | 4 GB | 8 GB |
-| CPU | 2 cores | 4 cores |
-| Storage | 20 GB | 40 GB |
-| GPU | Not required | 6GB+ VRAM (RTX 3060 or better) |
-| OS | Ubuntu 22.04 | Ubuntu 22.04 |
+| Resource | Minimum (CPU mode) | Recommended (GPU mode)         |
+| -------- | ------------------ | ------------------------------ |
+| RAM      | 4 GB               | 8 GB                           |
+| CPU      | 2 cores            | 4 cores                        |
+| Storage  | 20 GB              | 40 GB                          |
+| GPU      | Not required       | 6GB+ VRAM (RTX 3060 or better) |
+| OS       | Ubuntu 22.04       | Ubuntu 22.04                   |
 
 ### GPU vs CPU Mode
 
 Girivinity detects your hardware automatically at startup. You never need to change config.
 
-| Operation | CPU Mode | GPU Mode |
-|---|---|---|
-| Inference | float32, slower | 4-bit NF4 quantized, 5-10x faster |
-| LoRA fine-tuning | Runs, takes longer | AMP float16, much faster |
-| Pretraining | Possible but slow | Recommended, use gradient checkpointing |
-| Successor retraining | Hours to days | Minutes to hours |
-| Min RAM / VRAM | 4GB RAM | 6GB VRAM |
-| Cost | Free (any VPS) | ~$0.35/hr (Lambda Labs T4) |
+| Operation            | CPU Mode           | GPU Mode                                |
+| -------------------- | ------------------ | --------------------------------------- |
+| Inference            | float32, slower    | 4-bit NF4 quantized, 5-10x faster       |
+| LoRA fine-tuning     | Runs, takes longer | AMP float16, much faster                |
+| Pretraining          | Possible but slow  | Recommended, use gradient checkpointing |
+| Successor retraining | Hours to days      | Minutes to hours                        |
+| Min RAM / VRAM       | 4GB RAM            | 6GB VRAM                                |
+| Cost                 | Free (any VPS)     | ~$0.35/hr (Lambda Labs T4)              |
 
 **To force CPU mode** (e.g. for testing):
+
 ```yaml
 # config.yaml
 compute:
@@ -622,6 +636,7 @@ compute:
 ```
 
 **To verify which mode is active:**
+
 ```bash
 curl http://localhost:8000/health/deep
 # Returns: "compute": {"device": "cuda", "gpu_name": "...", "inference_mode": "4bit_nf4_gpu"}
@@ -639,6 +654,7 @@ pip install -r requirements.txt
 ```
 
 Verify installation:
+
 ```bash
 python -c "import torch, chromadb, sentence_transformers; print('OK')"
 ```
@@ -777,6 +793,7 @@ python model/quantise.py \
 ```
 
 Verify the output:
+
 ```bash
 ls -lh models/girivinity_quantised/model.gguf
 ```
@@ -791,8 +808,8 @@ Make sure these paths are set correctly:
 model:
   quantised_path: models/girivinity_quantised/model.gguf
   n_ctx: 4096
-  n_threads: 3        # cpu_count - 1
-  n_gpu_layers: 0     # 0 = CPU fallback for GGUF inference
+  n_threads: 3 # cpu_count - 1
+  n_gpu_layers: 0 # 0 = CPU fallback for GGUF inference
 
 training:
   queue_db: data/training.db
@@ -831,6 +848,7 @@ curl -X POST http://localhost:8000/chat/message \
 ```
 
 Expected response shape:
+
 ```json
 {
   "answer": "...",
@@ -849,6 +867,7 @@ sudo nano /etc/systemd/system/girivinity.service
 ```
 
 Paste:
+
 ```ini
 [Unit]
 Description=Girivinity AI Server
@@ -880,6 +899,7 @@ sudo systemctl status girivinity
 ## Development Guide
 
 ### Run tests
+
 ```bash
 pytest -q                          # all tests
 pytest tests/test_architecture.py  # specific file
@@ -887,21 +907,25 @@ pytest -k "test_kb_hit"            # specific test
 ```
 
 ### Lint
+
 ```bash
 ruff check .
 ```
 
 ### Watch self-training logs
+
 ```bash
 tail -f logs/self_training.jsonl | python -m json.tool
 ```
 
 ### Watch for successor model notifications
+
 ```bash
 tail -f logs/admin_notifications.jsonl | python -m json.tool
 ```
 
 ### Submit user feedback (to influence successor triggers)
+
 ```bash
 curl -X POST http://localhost:8000/admin/feedback \
   -H "Content-Type: application/json" \
@@ -909,6 +933,7 @@ curl -X POST http://localhost:8000/admin/feedback \
 ```
 
 ### Manually approve a successor model
+
 ```bash
 # List available versions
 curl http://localhost:8000/admin/model-versions
@@ -926,18 +951,18 @@ All configuration lives in `config.yaml`. Key sections:
 ```yaml
 modules:
   self_training:
-    interval_seconds: 1800        # Check queue every 30 minutes
-    chunk_threshold: 50           # Min chunks before LoRA fires
-    base_model_path: models/base  # Where trained base model lives
+    interval_seconds: 1800 # Check queue every 30 minutes
+    chunk_threshold: 50 # Min chunks before LoRA fires
+    base_model_path: models/base # Where trained base model lives
     adapters_dir: models/adapters # Where LoRA adapters are saved
     epochs: 3
     learning_rate: 0.0002
-    loss_abort_threshold: 2.0     # Abort LoRA if loss exceeds this
+    loss_abort_threshold: 2.0 # Abort LoRA if loss exceeds this
 
 successor_engine:
-  check_interval_seconds: 86400  # Check every 24 hours
-  knowledge_base_threshold: 100000  # Chunks before full retrain
-  quality_score_threshold: 3.5   # Avg feedback below this triggers
+  check_interval_seconds: 86400 # Check every 24 hours
+  knowledge_base_threshold: 100000 # Chunks before full retrain
+  quality_score_threshold: 3.5 # Avg feedback below this triggers
   versions_dir: models/versions
   notifications_path: logs/admin_notifications.jsonl
 

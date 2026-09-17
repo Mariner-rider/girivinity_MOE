@@ -177,7 +177,7 @@ compute:
 
 crawler:
   max_depth: 100
-  concurrent_requests: 3200000
+  concurrent_requests: 32
   download_timeout_seconds: 20
   trust_threshold: 0.6
   obey_robots_txt: true
@@ -193,7 +193,7 @@ training:
   lora_alpha: 32
   lora_dropout: 0.05
   target_modules: ["q_proj", "v_proj", "k_proj", "o_proj"]
-  queue_db: "data/training_queue.sqlite3"
+  queue_db:
   check_interval_minutes: 30
   min_batch_size: 50
   epochs: 3
@@ -273,7 +273,7 @@ modules:
   crawler:
     enabled: true
     obey_robots_txt: true
-    concurrent_requests: 3200000
+    concurrent_requests: 32
     max_depth: 100
     trust_threshold: 0.6
   rag:
@@ -347,11 +347,11 @@ successor_engine:
   feedback_window: 1000
   trained_collection: "trained"
   chroma_path: null
-  feedback_db_path: "data/user_feedback.sqlite3"
+  feedback_db_path: 
   training_root: "data/successor_training"
   versions_dir: "models/versions"
   active_model_symlink: "models/active"
-  notifications_path: "admin_notifications.jsonl"
+  notifications_path: "logs/admin_notifications.jsonl"
   state_path: "data/successor_state.json"
   batch_size: 2
   epochs: 1

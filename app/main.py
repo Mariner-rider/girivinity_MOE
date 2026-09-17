@@ -34,7 +34,16 @@ async def lifespan(_: FastAPI):
     _llm_runtime["config"] = get_system_config()
     app.state.rasp = RASPEngine(config={"security": getattr(settings, "security", {})})
     app.state.rasp_engine = app.state.rasp
-    _start_self_trainer_once()
+    import multiprocessing as mp
+    try:
+        mp.set_start_method("spawn", force=False)
+    except RuntimeError:
+        pass  # already set (spawn re-imports the app)
+    global _self_trainer_process
+    _self_trainer_process = SelfTrainer.start()   # exactly once
+    SuccessorEngine.start()                        # exactly once
+    from app.core.cuda_crawler import CUDACrawler
+    CUDACrawler().bootstrap_async()
     if settings.auto_load_model:
         _llm_runtime["runtime"] = GirivinityLoader().get_model()
     yield
@@ -84,23 +93,7 @@ def metrics() -> Response:
     return Response(content=generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
 
-@app.on_event("startup")
-async def start_self_trainer():
-    import multiprocessing
 
-    multiprocessing.set_start_method("spawn", force=True)
-    SelfTrainer.start()
-
-
-@app.on_event("startup")
-async def start_successor_engine():
-    SuccessorEngine.start()
-
-
-@app.on_event("startup")
-async def bootstrap_cuda():
-    from app.core.cuda_crawler import CUDACrawler
-    CUDACrawler().bootstrap_async()
 
 # --- v1 production endpoints -------------------------------------------------
 import json as _json
@@ -131,9 +124,24 @@ async def v1_chat(text: str = Form(...), image: UploadFile | None = File(None), 
         controller = AgentController()
         output = controller.execute(text, user_id=user_id) if hasattr(controller, "execute") else str(controller.run(text))
     except Exception as exc:
-        output = f"Processed request with local fallback. {exc}"
-    return StreamingResponse(_ndjson_stream(prefix + str(output)), media_type="application/x-ndjson")
-
+            logger.error("v1 chat failed: %s", exc)
+            return {
+                "id": chat_id,
+                "object": "chat.completion",
+                "created": created,
+                "model": "girivinity",
+                "choices": [
+                    {
+                        "message": {
+                            "role": "assistant",
+                            "content": "I'm unable to process that request right now. Please try again.",
+                        },
+                        "finish_reason": "error",
+                        "index": 0,
+                    }
+                ],
+                "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+            }
 
 @app.post("/v1/analyze/code")
 async def v1_analyze_code(payload: dict = Body(...)):
@@ -163,9 +171,11 @@ async def v1_cve(cve_id: str):
 
 @app.post("/v1/cve/search")
 async def v1_cve_search(payload: dict = Body(...)):
-    keyword = payload.get("keyword", "")
-    limit = int(payload.get("limit", 10))
-    return [{"id": f"SEARCH-{i+1}", "summary": f"CVE summary matching {keyword}", "source": "local-index"} for i in range(min(limit, 10))]
+    return {
+        "results": [],
+        "keyword": payload.get("keyword", ""),
+        "note": "Local NVD index not built. Set NVD_API_KEY and run the NVD sync job to enable.",
+    }
 
 
 @app.get("/v1/mitre/{technique_id}")
@@ -183,9 +193,39 @@ async def v1_ioc_check(payload: dict = Body(...)):
 
 @app.get("/v1/system/status")
 async def v1_system_status():
-    rag_docs = 0
-    return {"model_loaded": "runtime" in _llm_runtime, "backend": "girivinity", "current_generation": 1, "parameter_scale": "3B", "rag_docs": rag_docs, "training_queue_size": 0, "last_training_cycle": None, "gpu_util_pct": 0.0}
-
+    queue_size, last_cycle, rag_docs = 0, None, 0
+    try:
+        from app.core.db import fetchone
+        row = fetchone("SELECT COUNT(*) FROM training_queue WHERE status='pending'")
+        queue_size = row[0] if row else 0
+    except Exception:
+        pass
+    try:
+        import json as _json
+        log = Path("logs/self_training.jsonl")
+        if log.exists():
+            lines = [l for l in log.read_text().splitlines() if l.strip()]
+            if lines:
+                last_cycle = _json.loads(lines[-1]).get("timestamp")
+    except Exception:
+        pass
+    try:
+        import chromadb
+        import yaml as _yaml
+        cfg = _yaml.safe_load(Path("config.yaml").read_text())
+        col = chromadb.PersistentClient(path=cfg["rag"]["chroma_path"]).get_or_create_collection("girivinity_knowledge")
+        rag_docs = col.count()
+    except Exception:
+        pass
+    return {
+        "model_loaded": "runtime" in _llm_runtime,
+        "backend": "girivinity",
+        "current_generation": 1,
+        "parameter_scale": "3B",
+        "rag_docs": rag_docs,
+        "training_queue_size": queue_size,
+        "last_training_cycle": last_cycle,
+    }
 
 @app.get("/v1/system/metrics")
 async def v1_system_metrics():
@@ -199,9 +239,17 @@ async def v1_training_status():
 
 @app.post("/v1/training/trigger")
 async def v1_training_trigger():
-    from app.training.self_improvement_loop import SelfImprovementResult
-    r = SelfImprovementResult(success=True, training_triggered=False, finished_at=_time.time())
-    return r.__dict__
+    from starlette.concurrency import run_in_threadpool
+
+    from app.core.self_trainer import SelfTrainer
+
+    def _run() -> int:
+        trainer = SelfTrainer()
+        trainer._check_and_train()
+        return 0
+
+    await run_in_threadpool(_run)
+    return {"training_triggered": True, "finished_at": _time.time()}
 
 
 @app.post("/v1/feedback")

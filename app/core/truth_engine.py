@@ -26,6 +26,7 @@ class VerifiedResponse:
 class TruthEngine:
     UNVERIFIED_THRESHOLD = 0.30
     EVIDENCE_SIMILARITY = 0.70
+    WEB_SIMILARITY = 0.55
 
     def __init__(self) -> None:
         cfg = yaml.safe_load(Path("config.yaml").read_text())
@@ -97,15 +98,12 @@ class TruthEngine:
         return claims
 
     def _verify_claim(self, claim: str, web_sources: list[dict] | None) -> tuple[str, str | None]:
-        embedder = get_embedder()
-        vec = embedder.encode(claim).tolist()
+        from sentence_transformers import util
 
+        embedder = get_embedder()
+        vec = embedder.encode(claim, convert_to_tensor=True)
         try:
-            results = self.kb.query(
-                query_embeddings=[vec],
-                n_results=1,
-                include=["distances"],
-            )
+            results = self.kb.query(query_embeddings=[vec.tolist()], n_results=1, include=["distances"])
             distances = results["distances"][0] if results["distances"] else []
             if distances:
                 score = max(0.0, 1.0 - distances[0] / 2.0)
@@ -115,12 +113,18 @@ class TruthEngine:
             logger.warning("KB verification failed: %s", exc)
 
         if web_sources:
-            for src in web_sources:
-                url = src.get("url", "")
-                src_score = src.get("score", 0.0)
-                if src_score >= 0.45:
-                    return "WEB_SOURCED", url
-
+            texts = [
+                f"{s.get('title', '')} {s.get('text', '')}".strip()
+                for s in web_sources
+            ]
+            texts = [t for t in texts if t]
+            if texts:
+                sims = util.cos_sim(
+                    vec, embedder.encode(texts, convert_to_tensor=True)
+                )[0]
+                best = int(sims.argmax())
+                if float(sims[best]) >= self.WEB_SIMILARITY:
+                    return "WEB_SOURCED", web_sources[best].get("url")
         return "UNVERIFIED", None
 
     def _format_citations(
