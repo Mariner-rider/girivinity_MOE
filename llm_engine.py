@@ -76,6 +76,12 @@ class LLMEngine:
         return "llama_cpp" if has_gguf else "transformers"
 
     def load(self) -> "LLMEngine":
+        # A native GirivinityModel only exists as PyTorch weights — it must
+        # never be routed to the llama_cpp/GGUF backend, even when a GGUF
+        # file happens to exist on the machine.
+        if bool(getattr(self.config, "use_native_model", False)):
+            self._active_backend = "transformers"
+            return self._load_transformers()
         backend = self.auto_detect_backend(self.config)
         self._active_backend = backend
         if backend == "llama_cpp":
@@ -175,6 +181,9 @@ class LLMEngine:
                     yield token
             return
         if self.use_native_model:
+            # GirivinityModel.generate is whole-sequence; yield the full
+            # completion as a single chunk (per-token streaming is a
+            # follow-up upgrade via a generate() callback).
             text = self._generate_native(prompt, max_tokens, **generation_kwargs).text
             if text:
                 yield text
@@ -183,7 +192,6 @@ class LLMEngine:
         text = self._generate_huggingface(prompt, max_tokens, **generation_kwargs)
         if text:
             yield text
-
 
     def _generate_llama_cpp(self, prompt: str, **overrides: Any) -> GenerationResult:
         llama = getattr(self, "_llama", None)
@@ -238,7 +246,6 @@ class LLMEngine:
         input_length = encoded["input_ids"].shape[-1]
         completion_ids = output_ids[:, input_length:]
         return self.tokenizer.decode(completion_ids[0], skip_special_tokens=True)
-
 
     def get_token_entropy(self, prompt: str = "", text: str | None = None) -> float:
         """Compute next-token entropy from model logits; fallback to lexical entropy offline."""
@@ -359,6 +366,15 @@ class GirivinityEngine:
     def __init__(self, loader: GirivinityLoader | None = None) -> None:
         self._loader = loader or GirivinityLoader.instance()
         self._model = self._loader.get_model()
+        self._native_engine: LLMEngine | None = None
+
+    def _native_llm_engine(self) -> LLMEngine:
+        """One shared LLMEngine for the native model — created lazily and
+        reused across calls (the loader caches the weights; the engine only
+        adds the generation wrapper)."""
+        if self._native_engine is None:
+            self._native_engine = LLMEngine(config=self._loader.config, loader=self._loader).load()
+        return self._native_engine
 
     def generate(
         self,
@@ -367,8 +383,7 @@ class GirivinityEngine:
         stream: bool = True,
     ) -> Iterator[str] | str:
         if self._loader.use_native_model:
-            engine = LLMEngine(loader=self._loader).load()
-            return engine.generate(prompt, max_tokens=max_tokens, stream=stream)
+            return self._native_llm_engine().generate(prompt, max_tokens=max_tokens, stream=stream)
         if stream:
             return self._stream(prompt, max_tokens)
         result = self._model(prompt, max_tokens=max_tokens, stream=False)

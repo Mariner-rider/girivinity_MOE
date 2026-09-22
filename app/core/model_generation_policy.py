@@ -1,10 +1,9 @@
 from __future__ import annotations
 
 import logging
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any
-
 
 logger = logging.getLogger(__name__)
 
@@ -23,6 +22,13 @@ class ModelGeneration:
     min_training_tokens: int
     estimated_gpu_hours: float
     description: str
+    # MoE shape for this generation. All zeros = dense generation.
+    # When set on a roadmap entry, successor_config() builds the successor
+    # GirivinityConfig with exactly this expert layout.
+    n_routed_experts: int = 0
+    n_activated_experts: int = 0
+    n_shared_experts: int = 0
+    moe_start_layer: int = 1
 
 
 GENERATION_ROADMAP: list[ModelGeneration] = [
@@ -53,6 +59,10 @@ GENERATION_ROADMAP: list[ModelGeneration] = [
         min_training_tokens=10_000_000_000,
         estimated_gpu_hours=4_000,
         description="Scaled general-purpose Girivinity generation. 7B parameters.",
+        # Example: to make Gen-2 an explicit MoE generation, set e.g.
+        # n_routed_experts=64, n_activated_experts=6, n_shared_experts=2.
+        # Left at 0 → successor_config() applies the default MoE preset
+        # (64 routed / 6 active / 2 shared) automatically.
     ),
     ModelGeneration(
         generation=3,
@@ -100,6 +110,7 @@ GENERATION_ROADMAP: list[ModelGeneration] = [
 
 
 class GenerationPolicy:
+
     def __init__(self, config_path: str | Path = "config.yaml") -> None:
         self.config_path = Path(config_path)
 
@@ -119,6 +130,37 @@ class GenerationPolicy:
             next_generation.name,
         )
         return next_generation
+
+    def successor_config(self, current: GirivinityConfig) -> GirivinityConfig:
+        """Build the GirivinityConfig the NEXT generation should pretrain with.
+
+        Precedence:
+        1. The next roadmap entry explicitly sets MoE fields → use them.
+        2. Current model is already MoE → grow_experts() (doubles routed +
+           activated experts, keeps everything else — sparse-upcycling path).
+        3. Otherwise → enable the default fine-grained MoE preset
+           (64 routed / 6 active / 2 shared, from layer 1).
+        """
+        from model.architecture import GirivinityConfig  # local: keeps this module import-light
+
+        next_gen = self.get_next_generation()
+        if next_gen.n_routed_experts > 0:
+            return replace(
+                current,
+                n_routed_experts=next_gen.n_routed_experts,
+                n_activated_experts=next_gen.n_activated_experts or min(6, next_gen.n_routed_experts),
+                n_shared_experts=next_gen.n_shared_experts or 2,
+                moe_start_layer=next_gen.moe_start_layer or 1,
+            )
+        if current.moe_enabled:
+            return current.grow_experts()
+        return replace(
+            current,
+            n_routed_experts=64,
+            n_activated_experts=6,
+            n_shared_experts=2,
+            moe_start_layer=1,
+        )
 
     def status_report(self) -> dict[str, Any]:
         current = self.get_current_generation()
@@ -141,6 +183,10 @@ class GenerationPolicy:
         ffn_dim = _round_to_multiple(int(hidden_dim * 2.67), 256)
         max_seq_len = min(last_gen.max_seq_len * 2, 1_000_000)
         rounded_params = round(next_params)
+        # Carry MoE forward: double experts each extrapolated generation,
+        # keep shared-expert count and start layer (0 = dense stays dense).
+        n_routed = last_gen.n_routed_experts * 2 if last_gen.n_routed_experts > 0 else 0
+        n_activated = last_gen.n_activated_experts * 2 if n_routed > 0 else 0
         return ModelGeneration(
             generation=next_gen_number,
             name=f"Girivinity-{rounded_params}B",
@@ -157,6 +203,10 @@ class GenerationPolicy:
                 f"Auto-generated generation {next_gen_number}. "
                 f"{rounded_params}B parameters."
             ),
+            n_routed_experts=n_routed,
+            n_activated_experts=n_activated,
+            n_shared_experts=last_gen.n_shared_experts if n_routed > 0 else 0,
+            moe_start_layer=last_gen.moe_start_layer if n_routed > 0 else 1,
         )
 
     def _configured_generation_number(self) -> int:

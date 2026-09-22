@@ -7,9 +7,11 @@ import time
 from datetime import datetime
 from pathlib import Path
 
+import torch
 import yaml
 
 from app.core.db import get_conn
+from app.finetune.native_lora_trainer import NativeSelfTrainer
 
 logger = logging.getLogger(__name__)
 
@@ -119,157 +121,48 @@ class SelfTrainer:
             self._log_event(ts, len(rows), "success")
 
     def _run_lora_update(self, dataset_path: Path, version: str) -> bool:
-    import json as _json
-
-    import torch
-    import torch.nn as nn
-    import torch.nn.functional as F
-    from datasets import Dataset
-    from peft import LoraConfig, PeftModel, TaskType, get_peft_model
-    from transformers import (
-        DataCollatorForLanguageModeling,
-        PreTrainedTokenizerFast,
-        Trainer,
-        TrainingArguments,
-    )
-
-    from model.architecture import GirivinityConfig, GirivinityModel
-
-    final_dir = self.base_model / "final"
-    if not (final_dir / "model.pt").exists():
-        logger.warning(
-            "Base model not found at %s — skipping. Build it first with: "
-            "python -m app.training.pretrain --config config.yaml",
-            final_dir,
-        )
-        return False
-
-    try:
-        # 1) Load Girivinity's OWN native weights — not HF AutoModel.
-        cfg = GirivinityConfig.from_yaml()
-        cfg_path = final_dir / "config.yaml"
-        if cfg_path.exists():
-            data = yaml.safe_load(cfg_path.read_text()) or {}
-            fields = {k: v for k, v in data.items() if k in GirivinityConfig.__dataclass_fields__}
-            cfg = GirivinityConfig(**fields)
-        base = GirivinityModel(cfg)
-        state = torch.load(final_dir / "model.pt", map_location="cpu")
-        base.load_state_dict(state)
-
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        on_gpu = device.type == "cuda"
-        if on_gpu:
-            free_vram, _ = torch.cuda.mem_get_info()
-            if free_vram < 4 * 1024 ** 3:
-                logger.warning("GPU has %.1fGB free (<4GB); falling back to CPU", free_vram / 1e9)
-                device = torch.device("cpu")
-                on_gpu = False
-        logger.info("Training on %s", torch.cuda.get_device_name(0) if on_gpu else "CPU")
-
-        # 2) Wrapper that computes a real causal-LM loss for HF Trainer
-        #    (Trainer takes outputs[0] as the loss for non-dict outputs).
-        class _LoRALearner(nn.Module):
-            def __init__(self, model: nn.Module) -> None:
-                super().__init__()
-                self.base = model
-
-            def forward(self, input_ids=None, labels=None, **kwargs):
-                output = self.base(input_ids)
-                logits = output[0]
-                if labels is None:
-                    return (logits,)
-                shift_logits = logits[:, :-1, :]
-                shift_labels = labels[:, 1:]
-                loss = F.cross_entropy(
-                    shift_logits.reshape(-1, shift_logits.size(-1)),
-                    shift_labels.reshape(-1),
-                    ignore_index=-100,
-                )
-                return (loss, logits)
-
-        learner = _LoRALearner(base)
-
-        # 3) LoRA on the native attention projections
-        #    (GroupedQueryAttention names them q_proj/k_proj/v_proj/o_proj).
-        st_cfg = yaml.safe_load(Path("config.yaml").read_text())
-        target_modules = (
-            st_cfg.get("training", {}).get("target_modules")
-            or ["q_proj", "v_proj", "k_proj", "o_proj"]
-        )
-        lora_cfg = LoraConfig(
-            r=16,
-            lora_alpha=32,
-            target_modules=target_modules,
-            lora_dropout=0.05,
-            task_type=TaskType.CAUSAL_LM,
-        )
-        latest = self.adapters_dir / "latest"
-        if latest.exists() and latest.is_symlink():
-            # is_trainable=True is REQUIRED — otherwise the resumed adapter
-            # is frozen and "training" is a silent no-op.
-            model = PeftModel.from_pretrained(learner, str(latest), is_trainable=True)
-        else:
-            model = get_peft_model(learner, lora_cfg)
-        model = model.to(device)
-
-        # 4) Wrap the native tokenizers file in the HF fast class.
-        tokenizer = PreTrainedTokenizerFast(tokenizer_file="models/tokeniser/tokeniser.json")
-        if tokenizer.pad_token is None:
-            tokenizer.pad_token = tokenizer.unk_token or tokenizer.eos_token
-        if tokenizer.pad_token is None:
-            raise RuntimeError("tokeniser has no pad/unk/eos token")
-
-        records = []
-        with open(dataset_path, encoding="utf-8") as f:
-            for line in f:
-                r = _json.loads(line)
-                records.append(
-                    {"text": f"### Instruction:\n{r['instruction']}\n\n### Response:\n{r['response']}"}
-                )
-
-        def tokenize(ex: dict) -> dict:
-            return tokenizer(ex["text"], truncation=True, max_length=1024, padding="max_length")
-
-        tokenized = Dataset.from_list(records).map(tokenize, batched=True, remove_columns=["text"])
-
-        adapter_out = self.adapters_dir / version
-        adapter_out.mkdir(parents=True, exist_ok=True)
-
-        result = Trainer(
-            model=model,
-            args=TrainingArguments(
-                output_dir=str(adapter_out),
-                num_train_epochs=self.epochs,
-                per_device_train_batch_size=2,
-                learning_rate=self.lr,
-                logging_steps=10,
-                save_strategy="no",
-                fp16=on_gpu,
-                dataloader_num_workers=4 if on_gpu else 0,
-                no_cuda=not on_gpu,
-                report_to="none",
-            ),
-            train_dataset=tokenized,
-            data_collator=DataCollatorForLanguageModeling(tokenizer, mlm=False),
-        ).train()
-
-        if result.training_loss > self.loss_abort:
-            self._log_alert(version, result.training_loss)
+        """Fine-tune the NATIVE GirivinityModel with LoRA on attention +
+        MoE experts + router (no PEFT, no HuggingFace). Same contract as
+        before: train on the JSONL, save a versioned adapter, flip the
+        'latest' symlink, honour loss_abort."""
+        final_dir = self.base_model / "final"
+        if not (final_dir / "model.pt").exists():
+            logger.warning(
+                "Base model not found at %s — skipping. Build it first with: "
+                "python -m app.training.pretrain --config config.yaml",
+                final_dir,
+            )
             return False
 
-        model.save_pretrained(str(adapter_out))
-        latest_link = self.adapters_dir / "latest"
-        if latest_link.is_symlink():
-            latest_link.unlink()
-        latest_link.symlink_to(adapter_out.resolve())
-        return True
+        try:
+            adapter_out = self.adapters_dir / version
+            latest_link = self.adapters_dir / "latest"
 
-    except Exception as exc:
-        logger.error("LoRA update failed: %s", exc)
-        return False
-    finally:
-        if device.type == "cuda":
-            torch.cuda.empty_cache()
+            trainer = NativeSelfTrainer(
+                base_model_path=str(final_dir),
+                adapter_dir=str(adapter_out),
+                lr=self.lr,
+                epochs=self.epochs,
+                resume_from=str(latest_link.resolve())
+                if latest_link.is_symlink() else None,
+            )
+            avg_loss = trainer.train_on_jsonl(str(dataset_path))
+
+            if avg_loss > self.loss_abort:
+                self._log_alert(version, avg_loss)
+                return False
+
+            if latest_link.is_symlink():
+                latest_link.unlink()
+            latest_link.symlink_to(adapter_out.resolve())
+            return True
+
+        except Exception as exc:
+            logger.error("LoRA update failed: %s", exc)
+            return False
+        finally:
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
     def _init_db(self) -> None:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)

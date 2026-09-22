@@ -135,7 +135,7 @@ class GirivinityPretrainer:
             if eos_id is not None:
                 token_ids.append(eos_id)
 
-        dataset = _PackedTokenDataset(token_ids, seq_len=self.config.model_config.max_seq_len)
+        dataset = _PackedTokenDataset(token_ids, seq_len=getattr(self.config, "train_seq_len", None) or self.config.model_config.max_seq_len)
         val_size = max(1, int(len(dataset) * 0.05)) if len(dataset) > 1 else 0
         train_size = len(dataset) - val_size
         if val_size:
@@ -239,7 +239,7 @@ class GirivinityPretrainer:
             self.model.train()
         return losses
 
-    def _training_step(self, batch: dict[str, Tensor], amp_enabled: bool) -> tuple[Tensor, int]:
+        def _training_step(self, batch: dict[str, Tensor], amp_enabled: bool) -> tuple[Tensor, int]:
         input_ids = batch["input_ids"].to(self.device, non_blocking=True)
         labels = batch["labels"].to(self.device, non_blocking=True)
         with torch.cuda.amp.autocast(enabled=amp_enabled):
@@ -273,6 +273,9 @@ class GirivinityPretrainer:
                     logits.reshape(-1, logits.size(-1)),
                     labels.reshape(-1),
                 )
+            # Router z-loss needs NO code here: it is injected inside
+            # GirivinityModel.forward (value-neutral gradient patch) so it
+            # works with the gradient checkpointing enabled above.
         return loss, labels.numel()
 
     def _loader_loss(self, loader: DataLoader) -> float:

@@ -68,11 +68,15 @@ def train(
     grad_accum: int = 8,
     max_len: int = 1024,
     save_every: int = 1000,
+    model_config: GirivinityConfig | None = None,
 ) -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger.info("Training on device: %s", device)
 
-    cfg = GirivinityConfig.from_yaml()
+    # model_config lets callers (e.g. SuccessorEngine) train the NEXT
+    # generation's architecture instead of whatever config.yaml currently
+    # describes. None = default to the current configured architecture.
+    cfg = model_config or GirivinityConfig.from_yaml()
     model = GirivinityModel(cfg).to(device)
     logger.info("Model: %s", model.param_count())
 

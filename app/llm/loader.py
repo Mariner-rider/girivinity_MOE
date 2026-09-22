@@ -1,5 +1,6 @@
 import logging
 from dataclasses import dataclass
+from typing import Any
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
@@ -20,8 +21,8 @@ _DTYPE_MAP = {
 
 @dataclass(slots=True)
 class LoadedLLM:
-    tokenizer: AutoTokenizer
-    model: AutoModelForCausalLM
+    tokenizer: Any   # AutoTokenizer or GirivinityTokenizerAdapter
+    model: Any       # AutoModelForCausalLM or GirivinityModel
 
 
 class QuantizedLLMLoader:
@@ -39,6 +40,15 @@ class QuantizedLLMLoader:
 
     @secure_operation("llm.load_quantized")
     def load(self) -> LoadedLLM:
+        # Native branch: enabled via config.yaml model.use_native_model, or
+        # by setting MODEL_ID=girivinity-native in the environment.
+        from llm_loader import GirivinityLoader, ModelConfig
+
+        model_cfg = ModelConfig.from_yaml()
+        if model_cfg.use_native_model or self.settings.model_id == "girivinity-native":
+            loaded = GirivinityLoader(config=model_cfg).load()
+            return LoadedLLM(tokenizer=loaded.tokenizer, model=loaded.model)
+
         logger.info("Loading quantized model", extra={"model_id": self.settings.model_id})
 
         with MODEL_LOAD_SECONDS.time():

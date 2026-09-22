@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+import torch
 import yaml
 
 logger = logging.getLogger(__name__)
@@ -240,16 +241,90 @@ class GirivinityLoader:
         return self._model
 
     def _load_native_model(self) -> LoadedLLM:
+        """Load a native GirivinityModel.
+
+        Supports the pretrainer/successor checkpoint layout
+        (model.pt + config.yaml — e.g. models/base/final, or a run root whose
+        final/ subdirectory holds the weights) with fallback to the
+        save_pretrained layout (config.json + pytorch_model.bin). Raises
+        FileNotFoundError when no checkpoint exists, so callers (e.g. the
+        LLMSynthesiser) can fall back gracefully.
+        """
+        from model.architecture import GirivinityConfig, GirivinityModel
+
         if not self.native_model_path:
-            raise ValueError("model.native_model_path is required when use_native_model is true")
+            raise FileNotFoundError(
+                "model.use_native_model is true but model.native_model_path is empty. "
+                "Set it to a checkpoint dir containing model.pt + config.yaml "
+                "(e.g. models/base/final)."
+            )
 
-        from model.architecture import GirivinityModel
+        model_dir = Path(self.native_model_path)
+        weights_path = model_dir / "model.pt"
+        if not weights_path.exists():
+            if (model_dir / "final" / "model.pt").exists():
+                # Pointed at the run root (e.g. models/base) — weights live
+                # in its final/ subdirectory.
+                model_dir = model_dir / "final"
+                weights_path = model_dir / "model.pt"
+            elif (model_dir / "config.json").exists() and (model_dir / "pytorch_model.bin").exists():
+                logger.info("Loading native GirivinityModel (save_pretrained layout) from %s", model_dir)
+                model = GirivinityModel.load_pretrained(str(model_dir))
+                tokenizer = self._load_native_tokenizer(model_dir)
+                return LoadedLLM(model=model, tokenizer=tokenizer, use_native_model=True)
+            else:
+                raise FileNotFoundError(
+                    f"No native Girivinity checkpoint found at {self.native_model_path} "
+                    f"(looked for model.pt + config.yaml, then config.json + pytorch_model.bin). "
+                    f"Build one first: python -m app.training.pretrain --config config.yaml"
+                )
 
-        logger.info("Loading native GirivinityModel from %s", self.native_model_path)
-        model = GirivinityModel.load_pretrained(self.native_model_path)
-        tokenizer = GirivinityTokenizerAdapter.from_pretrained(self.native_model_path)
+        logger.info("Loading native GirivinityModel from %s", weights_path)
+        cfg = self._native_config_from(model_dir)
+        model = GirivinityModel(cfg)
+        try:
+            state = torch.load(weights_path, map_location="cpu", weights_only=True)
+        except Exception:
+            state = torch.load(weights_path, map_location="cpu", weights_only=False)
+        model.load_state_dict(state)
+
+        tokenizer = self._load_native_tokenizer(model_dir)
         logger.info("Native GirivinityModel loaded successfully")
         return LoadedLLM(model=model, tokenizer=tokenizer, use_native_model=True)
+
+    @staticmethod
+    def _native_config_from(model_dir: Path) -> "GirivinityConfig":
+        """Architecture from the checkpoint's own config.yaml, falling back
+        to the global config.yaml. The checkpoint wins so successors serve
+        with the architecture they were actually trained with."""
+        from model.architecture import GirivinityConfig
+
+        cfg_path = model_dir / "config.yaml"
+        if cfg_path.exists():
+            data = yaml.safe_load(cfg_path.read_text(encoding="utf-8")) or {}
+            fields = {k: v for k, v in data.items() if k in GirivinityConfig.__dataclass_fields__}
+            if fields:
+                return GirivinityConfig(**fields)
+        return GirivinityConfig.from_yaml()
+
+    @staticmethod
+    def _load_native_tokenizer(model_dir: Path) -> "GirivinityTokenizerAdapter":
+        """The tokenizer is trained once and shared — it is NOT saved into
+        every checkpoint dir. Search the checkpoint dir first, then the
+        known shared locations (both spellings)."""
+        candidates = [
+            model_dir / "tokenizer.json",
+            model_dir / "tokeniser.json",
+            Path("models/tokeniser/tokeniser.json"),
+            Path("models/tokenizer/tokenizer.json"),
+        ]
+        for path in candidates:
+            if path.exists():
+                logger.info("Loading GirivinityTokenizer from %s", path)
+                return GirivinityTokenizerAdapter.from_pretrained(str(path))
+        raise FileNotFoundError(
+            "No Girivinity tokenizer found. Tried: " + ", ".join(str(p) for p in candidates)
+        )
 
     def _load_huggingface_model(self) -> LoadedLLM:
         from transformers import AutoModelForCausalLM, AutoTokenizer

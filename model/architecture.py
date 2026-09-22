@@ -36,6 +36,10 @@ class GirivinityConfig:
     moe_intermediate_size: Optional[int] = None
     moe_start_layer: Optional[int] = None
     moe_bias_update_speed: float = 0.001
+    # Router z-loss (Patch 6): penalizes large router-logit magnitudes to
+    # stop logit drift under aux-loss-free bias balancing. The loss is
+    # injected gradient-only (forward values are unchanged); 0.0 = off.
+    moe_zloss_weight: float = 1e-4
 
     # --- QK-Norm (Qwen3 / Gemma3 style attention-stability improvement) ---
     qk_norm_enabled: bool = False
@@ -280,11 +284,8 @@ class GroupedQueryAttention(nn.Module):
 
         k_expanded = k.repeat_interleave(self.n_rep, dim=1)
         v_expanded = v.repeat_interleave(self.n_rep, dim=1)
-        attn = torch.matmul(q, k_expanded.transpose(-2, -1)) * self.scale
-        if mask is not None:
-            attn = attn + mask
-        attn = F.softmax(attn.float(), dim=-1).to(q.dtype)
-        out = torch.matmul(attn, v_expanded)
+        # is_causal handles the mask; no O(T^2) float mask materialization
+        out = F.scaled_dot_product_attention(q, k_expanded, v_expanded, is_causal=True)
         out = out.transpose(1, 2).contiguous().view(B, T, -1)
         return self.o_proj(out), new_cache
 
@@ -396,12 +397,8 @@ class MultiHeadLatentAttention(nn.Module):
 
         k_expanded = k.repeat_interleave(self.n_rep, dim=1)
         v_expanded = v.repeat_interleave(self.n_rep, dim=1)
-
-        attn = torch.matmul(q, k_expanded.transpose(-2, -1)) * self.scale
-        if mask is not None:
-            attn = attn + mask
-        attn = F.softmax(attn.float(), dim=-1).to(q.dtype)
-        out = torch.matmul(attn, v_expanded)
+        # is_causal handles the mask; no O(T^2) float mask materialization
+        out = F.scaled_dot_product_attention(q, k_expanded, v_expanded, is_causal=True)
         out = out.transpose(1, 2).contiguous().view(B, T, -1)
         return self.o_proj(out), new_cache
 
@@ -521,23 +518,35 @@ class MoELayer(nn.Module):
         x_flat = x.reshape(-1, D)
 
         logits = self.gate(x_flat) + self.routing_bias
+        # Stashed for the router z-loss (see GirivinityModel._apply_router_zloss).
+        # Under gradient checkpointing only the backward-recompute stash
+        # carries gradients; the model reads it via a value-neutral gradient
+        # patch, so this stash never affects forward values.
+        self._last_router_logits = logits
         probs = F.softmax(logits, dim=-1)
         topk_probs, topk_idx = torch.topk(probs, self.top_k, dim=-1)
         topk_probs = topk_probs / topk_probs.sum(dim=-1, keepdim=True).clamp_min(1e-9)
 
         out = torch.zeros_like(x_flat)
-        load = torch.zeros(self.n_routed, device=x.device)
 
-        for expert_idx in range(self.n_routed):
-            mask = topk_idx == expert_idx
-            token_mask = mask.any(dim=-1)
-            load[expert_idx] = token_mask.sum()
-            if not token_mask.any():
+        # Flatten (token, slot) pairs and sort by expert id -> grouped execution
+        flat_idx = topk_idx.reshape(-1)                                  # [N*K]
+        token_of = torch.arange(x_flat.size(0), device=x.device).repeat_interleave(self.top_k)
+        order = torch.argsort(flat_idx, stable=True)
+        sorted_experts = flat_idx[order]
+        sorted_tokens = token_of[order]
+        sorted_w = topk_probs.reshape(-1)[order]
+
+        boundaries = torch.searchsorted(
+            sorted_experts, torch.arange(self.n_routed + 1, device=x.device)
+        )
+        for e in range(self.n_routed):
+            s, t = int(boundaries[e]), int(boundaries[e + 1])
+            if s == t:
                 continue
-            selected = x_flat[token_mask]
-            expert_out = self.routed_experts[expert_idx](selected)
-            weight = topk_probs[token_mask][mask[token_mask]].unsqueeze(-1)
-            out[token_mask] = out[token_mask] + expert_out * weight
+            toks = sorted_tokens[s:t]
+            expert_out = self.routed_experts[e](x_flat[toks])
+            out.index_add_(0, toks, expert_out * sorted_w[s:t].unsqueeze(-1))
 
         if self.shared_experts is not None:
             for shared in self.shared_experts:
@@ -545,8 +554,8 @@ class MoELayer(nn.Module):
 
         if self.training:
             with torch.no_grad():
-                avg_load = load.mean()
-                self.routing_bias -= self.bias_update_speed * torch.sign(load - avg_load)
+                load = torch.bincount(flat_idx, minlength=self.n_routed).float()
+                self.routing_bias -= self.bias_update_speed * torch.sign(load - load.mean())
 
         return out.reshape(B, T, D)
 
@@ -669,6 +678,35 @@ class GirivinityModel(nn.Module):
         elif isinstance(module, nn.Embedding):
             nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
+    def _apply_router_zloss(self, logits: torch.Tensor) -> torch.Tensor:
+        """Value-neutral router z-loss (Patch 6).
+
+        Injects moe_zloss_weight * mean(router_logits^2) into the gradient
+        graph while leaving the forward VALUE of logits unchanged
+        (z - z.detach() == 0). This is what makes it work under
+        torch.utils.checkpoint: the stash written during the no-grad first
+        pass carries no grad (skipped here), while the stash rewritten
+        during the backward recompute does (handled per-layer inside
+        custom_forward). Covers the non-checkpointed training path too,
+        e.g. model/train.py's SFT/successor training.
+        """
+        cfg = self.cfg
+        if not (self.training and cfg.moe_enabled and cfg.moe_zloss_weight > 0):
+            return logits
+        z_terms: list[torch.Tensor] = []
+        for layer in self.layers:
+            ffn = layer.ffn
+            if isinstance(ffn, MoELayer):
+                router_logits = getattr(ffn, "_last_router_logits", None)
+                if router_logits is not None:
+                    z_terms.append((router_logits.float() ** 2).mean())
+        if not z_terms:
+            return logits
+        z = cfg.moe_zloss_weight * torch.stack(z_terms).sum()
+        if not z.requires_grad:
+            return logits   # no-grad stash: checkpoint first pass or eval
+        return logits + z - z.detach()
+
     def forward(self, input_ids: torch.Tensor, kv_caches: Optional[list[tuple]] = None) -> tuple[torch.Tensor, list[tuple]]:
         B, T = input_ids.shape
         x = self.embed(input_ids)
@@ -718,6 +756,18 @@ class GirivinityModel(nn.Module):
 
                 def custom_forward(hidden_states: torch.Tensor, checkpointed_layer: DecoderBlock = layer) -> torch.Tensor:
                     out, _ = checkpointed_layer(hidden_states, cos, sin, causal_mask, None, None)
+                    # Router z-loss gradient injection: during the backward
+                    # recompute the MoELayer stash carries grad, and this
+                    # zero-valued term routes z-loss gradients into the
+                    # recomputed graph. During the no-grad first pass it is
+                    # skipped (stash has no grad), so values are untouched.
+                    ffn = checkpointed_layer.ffn
+                    if self.training and self.cfg.moe_zloss_weight > 0 and isinstance(ffn, MoELayer):
+                        router_logits = getattr(ffn, "_last_router_logits", None)
+                        if router_logits is not None:
+                            z = self.cfg.moe_zloss_weight * (router_logits.float() ** 2).mean()
+                            if z.requires_grad:
+                                out = out + z - z.detach()
                     return out
 
                 layer_output = checkpoint(custom_forward, layer_input, use_reentrant=False)
@@ -746,8 +796,10 @@ class GirivinityModel(nn.Module):
             for module in self.mtp_modules:
                 mtp_hidden, module_logits = module(mtp_hidden)
                 mtp_logits.append(module_logits)
+            logits = self._apply_router_zloss(logits)
             return logits, mtp_logits, new_caches
 
+        logits = self._apply_router_zloss(logits)
         return logits, new_caches
 
     def gradient_checkpointing_enable(self) -> None:
