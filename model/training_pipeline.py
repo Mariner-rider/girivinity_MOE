@@ -317,8 +317,8 @@ class ImprovedLoRATrainer:
         self.max_seq_len = int(lora.get("max_seq_len", 2048))
         self.loss_abort = float(lora.get("loss_abort_threshold", 2.0))
         self.adapters_dir = Path(lora.get("adapters_dir", "models/adapters"))
-
-        db_base = Path(tr.get("queue_db", "data/training.db")).parent
+        
+        db_base = Path(tr.get("queue_db") or "data/training.db").parent
         self.dedup = Deduplicator(str(db_base / "dedup.db"))
         self.replay = ReplayBuffer(str(db_base / "replay.db"))
         self.scorer = DataQualityScorer()
