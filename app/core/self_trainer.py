@@ -21,7 +21,7 @@ class SelfTrainer:
         cfg = yaml.safe_load(Path("config.yaml").read_text())
         st = cfg["modules"]["self_training"]
         tr = cfg["training"]
-        self.db_path = Path(tr["queue_db"])
+        self.db_path = Path(tr.get("queue_db") or "data/training.db")
         self.interval_s = int(st["interval_seconds"])
         self.threshold = int(st["chunk_threshold"])
         self.base_model = Path(st["base_model_path"])

@@ -53,13 +53,12 @@ model:
     norm_eps: 0.00001
     rope_theta: 500000.0
     qk_norm_enabled: true
-    # --- MoE (DeepSeek-V3 style). Option A: full preset.
-    #     For Option B (3B-class) use the commented values instead.
-    n_routed_experts: 64 # Option B: 16
-    n_activated_experts: 6 # Option B: 4
+    # --- MoE (DeepSeek-V3 style) Option B: 3B-class (~2.7B active / 5.8B sparse)
+    n_routed_experts: 16
+    n_activated_experts: 4
     n_shared_experts: 2
     moe_start_layer: 1
-    # moe_intermediate_size: 2048  # defaults to ffn_dim//4; Option B: 1024
+    moe_intermediate_size: 1024
     moe_bias_update_speed: 0.001
 
   social_adaptability:
@@ -177,7 +176,7 @@ training:
   lora_alpha: 32
   lora_dropout: 0.05
   target_modules: ["q_proj", "v_proj", "k_proj", "o_proj"]
-  queue_db:
+  queue_db: "data/training.db"
   check_interval_minutes: 30
   min_batch_size: 50
   epochs: 3

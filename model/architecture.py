@@ -512,6 +512,15 @@ class MoELayer(nn.Module):
         # load-based heuristic during training, not by gradient descent.
         self.register_buffer("routing_bias", torch.zeros(self.n_routed))
         self.bias_update_speed = cfg.moe_bias_update_speed
+        self.defer_bias_update: bool = False
+        self._pending_load: Optional[torch.Tensor] = None
+
+    def update_routing_bias(self) -> None:
+        if self._pending_load is not None:
+            with torch.no_grad():
+                load = self._pending_load
+                self.routing_bias -= self.bias_update_speed * torch.sign(load - load.mean())
+                self._pending_load = None
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, T, D = x.shape
@@ -555,7 +564,9 @@ class MoELayer(nn.Module):
         if self.training:
             with torch.no_grad():
                 load = torch.bincount(flat_idx, minlength=self.n_routed).float()
-                self.routing_bias -= self.bias_update_speed * torch.sign(load - load.mean())
+                self._pending_load = load
+                if not getattr(self, "defer_bias_update", False):
+                    self.routing_bias -= self.bias_update_speed * torch.sign(load - load.mean())
 
         return out.reshape(B, T, D)
 
@@ -804,9 +815,20 @@ class GirivinityModel(nn.Module):
 
     def gradient_checkpointing_enable(self) -> None:
         self.gradient_checkpointing = True
+        for m in self.modules():
+            if isinstance(m, MoELayer):
+                m.defer_bias_update = True
 
     def gradient_checkpointing_disable(self) -> None:
         self.gradient_checkpointing = False
+        for m in self.modules():
+            if isinstance(m, MoELayer):
+                m.defer_bias_update = False
+
+    def update_moe_biases(self) -> None:
+        for m in self.modules():
+            if isinstance(m, MoELayer):
+                m.update_routing_bias()
 
     @torch.no_grad()
     def generate(self, input_ids: torch.Tensor, max_new_tokens: int = 256, temperature: float = 0.7, top_p: float = 0.9) -> torch.Tensor:
