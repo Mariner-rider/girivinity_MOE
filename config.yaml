@@ -343,7 +343,7 @@ successor_engine:
   train_seq_len: 256
   eval_split: 0.1
   device: "auto"
-  auto_quantize: true # Quantize successor to GGUF after training
+  auto_quantize: false  # GGUF export not yet functional for custom architecture
   quant_type: "Q4_K_M" # Quantization format for CPU inference
 
 cuda_engine:

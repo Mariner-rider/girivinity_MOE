@@ -14,16 +14,16 @@ modules:
   self_training:
     interval_seconds: 60
     chunk_threshold: {threshold}
-    base_model_path: "{tmp_path / 'models' / 'base'}"
-    adapters_dir: "{tmp_path / 'models' / 'adapters'}"
-    training_queue_dir: "{tmp_path / 'training_queue'}"
-    event_log_path: "{tmp_path / 'logs' / 'events.jsonl'}"
-    alerts_log_path: "{tmp_path / 'logs' / 'alerts.jsonl'}"
+    base_model_path: "{(tmp_path / 'models' / 'base').as_posix()}"
+    adapters_dir: "{(tmp_path / 'models' / 'adapters').as_posix()}"
+    training_queue_dir: "{(tmp_path / 'training_queue').as_posix()}"
+    event_log_path: "{(tmp_path / 'logs' / 'events.jsonl').as_posix()}"
+    alerts_log_path: "{(tmp_path / 'logs' / 'alerts.jsonl').as_posix()}"
     epochs: 1
     learning_rate: 0.0001
     loss_abort_threshold: 2.0
 training:
-  queue_db: "{tmp_path / 'db' / 'queue.sqlite3'}"
+  queue_db: "{(tmp_path / 'db' / 'queue.sqlite3').as_posix()}"
 """
     )
 

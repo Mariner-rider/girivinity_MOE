@@ -36,12 +36,14 @@ class PretrainConfig:
     checkpoint_every: int
     data_path: str
     output_dir: str
-    train_seq_len: int = 4096
+    train_seq_len: int = 0
     use_amp: bool = True
     use_fsdp: bool = False
     device: str = "auto"
 
     def __post_init__(self) -> None:
+        if self.train_seq_len <= 0:
+            self.train_seq_len = min(4096, self.model_config.max_seq_len)
         if self.batch_size < 1:
             raise ValueError("batch_size must be at least 1")
         if self.learning_rate <= 0:
