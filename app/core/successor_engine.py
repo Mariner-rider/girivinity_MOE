@@ -50,7 +50,7 @@ class SuccessorEngine:
         self.versions_dir = Path(se["versions_dir"])
         self.notifications_path = Path(se["notifications_path"])
         self.corpus_dir = Path(se.get("corpus_dir", se.get("training_root", "data/successor_training")))
-        self.db_path = Path(tr["queue_db"])
+        self.db_path = Path(tr.get("queue_db") or "data/training.db")
         self.active_link = Path(se.get("active_model_symlink", "models/active"))
         self.auto_quantize = bool(se.get("auto_quantize", True))
         self.quant_type = str(se.get("quant_type", "Q4_K_M"))

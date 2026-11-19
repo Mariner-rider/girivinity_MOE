@@ -12,6 +12,8 @@ import yaml
 
 from app.core.db import get_conn
 from app.finetune.native_lora_trainer import NativeSelfTrainer
+from app.finetune.update_gate import approve_model_update
+from app.security.training_poison_guard import TrainingPoisonGuard
 
 logger = logging.getLogger(__name__)
 
@@ -21,7 +23,7 @@ class SelfTrainer:
         cfg = yaml.safe_load(Path("config.yaml").read_text())
         st = cfg["modules"]["self_training"]
         tr = cfg["training"]
-        self.db_path = Path(tr["queue_db"])
+        self.db_path = Path(tr.get("queue_db") or "data/training.db")
         self.interval_s = int(st["interval_seconds"])
         self.threshold = int(st["chunk_threshold"])
         self.base_model = Path(st["base_model_path"])
@@ -94,8 +96,34 @@ class SelfTrainer:
         self.training_dir.mkdir(parents=True, exist_ok=True)
         dataset_path = self.training_dir / f"{ts}.jsonl"
 
+        # --- G-06: Scan every chunk through TrainingPoisonGuard before writing ---
+        guard = TrainingPoisonGuard()
+        clean_rows: list = []
+        quarantine_count = 0
+        for row in rows:
+            row_id, query, chunk_text, url = row
+            scan = guard.scan_chunk(chunk_text, url or "", query or "")
+            if scan.is_poisoned:
+                quarantine_count += 1
+                logger.warning(
+                    "SelfTrainer: quarantined row id=%s url=%s signals=%s confidence=%.3f",
+                    row_id, url, scan.signals, scan.confidence,
+                )
+            else:
+                clean_rows.append(row)
+
+        if quarantine_count:
+            logger.warning(
+                "SelfTrainer: %d/%d chunks quarantined by PoisonGuard",
+                quarantine_count, len(rows),
+            )
+
+        if not clean_rows:
+            logger.warning("SelfTrainer: all chunks quarantined — aborting training cycle")
+            return
+
         with open(dataset_path, "w", encoding="utf-8") as f:
-            for _, query, chunk_text, url in rows:
+            for _, query, chunk_text, url in clean_rows:
                 f.write(
                     json.dumps(
                         {
@@ -110,7 +138,7 @@ class SelfTrainer:
         success = self._run_lora_update(dataset_path, ts)
 
         if success:
-            ids = [r[0] for r in rows]
+            ids = [r[0] for r in clean_rows]
             placeholders = ",".join(["%s"] * len(ids))
             with get_conn() as conn:
                 with conn.cursor() as db:
@@ -118,7 +146,7 @@ class SelfTrainer:
                         f"UPDATE training_queue SET status='trained' WHERE id IN ({placeholders})",
                         ids,
                     )
-            self._log_event(ts, len(rows), "success")
+            self._log_event(ts, len(clean_rows), "success")
 
     def _run_lora_update(self, dataset_path: Path, version: str) -> bool:
         """Fine-tune the NATIVE GirivinityModel with LoRA on attention +
@@ -150,6 +178,25 @@ class SelfTrainer:
 
             if avg_loss > self.loss_abort:
                 self._log_alert(version, avg_loss)
+                return False
+
+            # --- G-06: Quality gate — require loss improvement before promoting adapter ---
+            try:
+                gate_passed = approve_model_update(
+                    baseline_score=self.loss_abort,
+                    candidate_score=avg_loss,
+                    benchmark_name="training_loss",
+                    min_delta=0.0,
+                )
+            except Exception as gate_exc:
+                logger.warning("SelfTrainer: update_gate raised %s — blocking promotion", gate_exc)
+                gate_passed = False
+
+            if not gate_passed:
+                logger.warning(
+                    "SelfTrainer: adapter promotion blocked by quality gate (avg_loss=%.4f)",
+                    avg_loss,
+                )
                 return False
 
             if latest_link.is_symlink():

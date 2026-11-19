@@ -2,7 +2,7 @@ import logging
 from contextlib import asynccontextmanager
 from typing import Any
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse, Response
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 
@@ -238,7 +238,10 @@ async def v1_training_status():
 
 
 @app.post("/v1/training/trigger")
-async def v1_training_trigger():
+async def v1_training_trigger(x_admin_key: str | None = Header(default=None, alias="X-Admin-Key")):
+    from app.security.api_auth import verify_admin_token
+    if not verify_admin_token(x_admin_key):
+        raise HTTPException(status_code=401, detail="Unauthorized: Valid X-Admin-Key required")
     from starlette.concurrency import run_in_threadpool
 
     from app.core.self_trainer import SelfTrainer
@@ -302,7 +305,10 @@ async def v1_agents_search(q: str = Query(..., min_length=1)):
 
 
 @app.post("/v1/agents")
-async def v1_agents_register(payload: dict = Body(...)):
+async def v1_agents_register(payload: dict = Body(...), x_admin_key: str | None = Header(default=None, alias="X-Admin-Key")):
+    from app.security.api_auth import verify_admin_token
+    if not verify_admin_token(x_admin_key):
+        raise HTTPException(status_code=401, detail="Unauthorized: Valid X-Admin-Key required to register agent definitions")
     from app.agents.agent_registry import AgentTypeDefinition
 
     required = ["agent_type_id", "display_name", "description", "base_system_prompt"]

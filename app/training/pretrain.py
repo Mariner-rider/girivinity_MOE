@@ -36,11 +36,14 @@ class PretrainConfig:
     checkpoint_every: int
     data_path: str
     output_dir: str
+    train_seq_len: int = 0
     use_amp: bool = True
     use_fsdp: bool = False
     device: str = "auto"
 
     def __post_init__(self) -> None:
+        if self.train_seq_len <= 0:
+            self.train_seq_len = min(4096, self.model_config.max_seq_len)
         if self.batch_size < 1:
             raise ValueError("batch_size must be at least 1")
         if self.learning_rate <= 0:
@@ -53,6 +56,8 @@ class PretrainConfig:
             raise ValueError("gradient_accumulation_steps must be at least 1")
         if self.checkpoint_every < 1:
             raise ValueError("checkpoint_every must be at least 1")
+        if self.train_seq_len < 2:
+            raise ValueError("train_seq_len must be at least 2")
 
     @classmethod
     def from_yaml(cls, config_path: str | Path) -> "PretrainConfig":
@@ -72,6 +77,7 @@ class PretrainConfig:
             checkpoint_every=int(pretrain["checkpoint_every"]),
             data_path=str(pretrain["data_path"]),
             output_dir=str(pretrain["output_dir"]),
+            train_seq_len=int(pretrain.get("train_seq_len", model_config_raw.get("max_seq_len", 4096))),
             use_amp=bool(pretrain.get("use_amp", True)),
             use_fsdp=bool(pretrain.get("use_fsdp", False)),
             device=str(pretrain.get("device", raw.get("compute", {}).get("device", "auto"))),
@@ -114,6 +120,11 @@ class GirivinityPretrainer:
         self.model.gradient_checkpointing_enable()
         self.model.to(self.device)
         self._wrap_fsdp_if_requested()
+        logger.info(
+            "GirivinityPretrainer initialized: max_seq_len=%d, train_seq_len=%d",
+            config.model_config.max_seq_len,
+            config.train_seq_len,
+        )
 
         self.train_loader: DataLoader | None = None
         self.val_loader: DataLoader | None = None
@@ -135,7 +146,7 @@ class GirivinityPretrainer:
             if eos_id is not None:
                 token_ids.append(eos_id)
 
-        dataset = _PackedTokenDataset(token_ids, seq_len=getattr(self.config, "train_seq_len", None) or self.config.model_config.max_seq_len)
+        dataset = _PackedTokenDataset(token_ids, seq_len=self.config.train_seq_len)
         val_size = max(1, int(len(dataset) * 0.05)) if len(dataset) > 1 else 0
         train_size = len(dataset) - val_size
         if val_size:
@@ -196,6 +207,7 @@ class GirivinityPretrainer:
             scaler.step(optimizer)
             scaler.update()
             scheduler.step()
+            self._base_model.update_moe_biases()
             optimizer.zero_grad(set_to_none=True)
 
             optimizer_step = (steps + 1) // self.config.gradient_accumulation_steps

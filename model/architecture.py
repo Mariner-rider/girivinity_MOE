@@ -40,6 +40,7 @@ class GirivinityConfig:
     # stop logit drift under aux-loss-free bias balancing. The loss is
     # injected gradient-only (forward values are unchanged); 0.0 = off.
     moe_zloss_weight: float = 1e-4
+    moe_capacity_factor: Optional[float] = None
 
     # --- QK-Norm (Qwen3 / Gemma3 style attention-stability improvement) ---
     qk_norm_enabled: bool = False
@@ -284,8 +285,12 @@ class GroupedQueryAttention(nn.Module):
 
         k_expanded = k.repeat_interleave(self.n_rep, dim=1)
         v_expanded = v.repeat_interleave(self.n_rep, dim=1)
-        # is_causal handles the mask; no O(T^2) float mask materialization
-        out = F.scaled_dot_product_attention(q, k_expanded, v_expanded, is_causal=True)
+        if mask is not None:
+            out = F.scaled_dot_product_attention(q, k_expanded, v_expanded, attn_mask=mask)
+        elif q.shape[2] == k_expanded.shape[2]:
+            out = F.scaled_dot_product_attention(q, k_expanded, v_expanded, is_causal=True)
+        else:
+            out = F.scaled_dot_product_attention(q, k_expanded, v_expanded, is_causal=False)
         out = out.transpose(1, 2).contiguous().view(B, T, -1)
         return self.o_proj(out), new_cache
 
@@ -397,8 +402,12 @@ class MultiHeadLatentAttention(nn.Module):
 
         k_expanded = k.repeat_interleave(self.n_rep, dim=1)
         v_expanded = v.repeat_interleave(self.n_rep, dim=1)
-        # is_causal handles the mask; no O(T^2) float mask materialization
-        out = F.scaled_dot_product_attention(q, k_expanded, v_expanded, is_causal=True)
+        if mask is not None:
+            out = F.scaled_dot_product_attention(q, k_expanded, v_expanded, attn_mask=mask)
+        elif q.shape[2] == k_expanded.shape[2]:
+            out = F.scaled_dot_product_attention(q, k_expanded, v_expanded, is_causal=True)
+        else:
+            out = F.scaled_dot_product_attention(q, k_expanded, v_expanded, is_causal=False)
         out = out.transpose(1, 2).contiguous().view(B, T, -1)
         return self.o_proj(out), new_cache
 
@@ -512,6 +521,29 @@ class MoELayer(nn.Module):
         # load-based heuristic during training, not by gradient descent.
         self.register_buffer("routing_bias", torch.zeros(self.n_routed))
         self.bias_update_speed = cfg.moe_bias_update_speed
+        self.defer_bias_update: bool = False
+        self._pending_load: Optional[torch.Tensor] = None
+        self.capacity_factor = getattr(cfg, "moe_capacity_factor", None)
+        self.last_overflow_count = 0
+
+    def count_total_parameters(self) -> int:
+        return sum(p.numel() for p in self.parameters() if p.requires_grad)
+
+    def count_active_parameters(self) -> int:
+        expert_params = sum(p.numel() for p in self.routed_experts[0].parameters() if p.requires_grad)
+        shared_params = sum(p.numel() for p in self.shared_experts.parameters() if p.requires_grad) if self.shared_experts else 0
+        gate_params = sum(p.numel() for p in self.gate.parameters() if p.requires_grad)
+        return gate_params + shared_params + (self.top_k * expert_params)
+
+    def count_inactive_parameters(self) -> int:
+        return self.count_total_parameters() - self.count_active_parameters()
+
+    def update_routing_bias(self) -> None:
+        if self._pending_load is not None:
+            with torch.no_grad():
+                load = self._pending_load
+                self.routing_bias -= self.bias_update_speed * torch.sign(load - load.mean())
+                self._pending_load = None
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, T, D = x.shape
@@ -540,13 +572,27 @@ class MoELayer(nn.Module):
         boundaries = torch.searchsorted(
             sorted_experts, torch.arange(self.n_routed + 1, device=x.device)
         )
+        total_overflow = 0
+        if self.capacity_factor is not None:
+            import math
+            tokens_per_expert = math.ceil(
+                (x_flat.size(0) * self.top_k / self.n_routed) * self.capacity_factor
+            )
+        else:
+            tokens_per_expert = None
+
         for e in range(self.n_routed):
             s, t = int(boundaries[e]), int(boundaries[e + 1])
             if s == t:
                 continue
+            if tokens_per_expert is not None and (t - s) > tokens_per_expert:
+                total_overflow += (t - s) - tokens_per_expert
+                t = s + tokens_per_expert
             toks = sorted_tokens[s:t]
             expert_out = self.routed_experts[e](x_flat[toks])
             out.index_add_(0, toks, expert_out * sorted_w[s:t].unsqueeze(-1))
+
+        self.last_overflow_count = total_overflow
 
         if self.shared_experts is not None:
             for shared in self.shared_experts:
@@ -555,7 +601,9 @@ class MoELayer(nn.Module):
         if self.training:
             with torch.no_grad():
                 load = torch.bincount(flat_idx, minlength=self.n_routed).float()
-                self.routing_bias -= self.bias_update_speed * torch.sign(load - load.mean())
+                self._pending_load = load
+                if not getattr(self, "defer_bias_update", False):
+                    self.routing_bias -= self.bias_update_speed * torch.sign(load - load.mean())
 
         return out.reshape(B, T, D)
 
@@ -567,6 +615,16 @@ class DecoderBlock(nn.Module):
         self.ffn_norm  = RMSNorm(cfg.dim, cfg.norm_eps)
         self.attn = MultiHeadLatentAttention(cfg) if cfg.mla_enabled else GroupedQueryAttention(cfg)
         self.ffn  = ffn
+
+    def count_active_parameters(self) -> int:
+        total = sum(p.numel() for p in self.attn.parameters() if p.requires_grad)
+        total += sum(p.numel() for p in self.attn_norm.parameters() if p.requires_grad)
+        total += sum(p.numel() for p in self.ffn_norm.parameters() if p.requires_grad)
+        if isinstance(self.ffn, MoELayer):
+            total += self.ffn.count_active_parameters()
+        else:
+            total += sum(p.numel() for p in self.ffn.parameters() if p.requires_grad)
+        return total
 
     def forward(
         self,
@@ -707,7 +765,12 @@ class GirivinityModel(nn.Module):
             return logits   # no-grad stash: checkpoint first pass or eval
         return logits + z - z.detach()
 
-    def forward(self, input_ids: torch.Tensor, kv_caches: Optional[list[tuple]] = None) -> tuple[torch.Tensor, list[tuple]]:
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        kv_caches: Optional[list[tuple]] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+    ) -> tuple[torch.Tensor, list[tuple]]:
         B, T = input_ids.shape
         x = self.embed(input_ids)
 
@@ -727,6 +790,16 @@ class GirivinityModel(nn.Module):
             cos = self.rope_cos[past_len:past_len + T].to(x.device)
             sin = self.rope_sin[past_len:past_len + T].to(x.device)
         causal_mask = self.causal_mask_full[past_len:past_len + T, :past_len + T].to(x.device).unsqueeze(0).unsqueeze(0)
+        if attention_mask is not None:
+            if attention_mask.dim() == 2:
+                pad_mask = torch.zeros((B, 1, 1, past_len + T), device=x.device, dtype=causal_mask.dtype)
+                if attention_mask.dtype == torch.bool:
+                    pad_mask = pad_mask.masked_fill(~attention_mask.unsqueeze(1).unsqueeze(2), float("-inf"))
+                else:
+                    pad_mask = pad_mask.masked_fill(attention_mask.unsqueeze(1).unsqueeze(2) == 0, float("-inf"))
+                causal_mask = causal_mask + pad_mask
+            elif attention_mask.dim() == 4:
+                causal_mask = causal_mask + attention_mask
 
         streams = None
         if self.mhc is not None:
@@ -804,28 +877,77 @@ class GirivinityModel(nn.Module):
 
     def gradient_checkpointing_enable(self) -> None:
         self.gradient_checkpointing = True
+        for m in self.modules():
+            if isinstance(m, MoELayer):
+                m.defer_bias_update = True
 
     def gradient_checkpointing_disable(self) -> None:
         self.gradient_checkpointing = False
+        for m in self.modules():
+            if isinstance(m, MoELayer):
+                m.defer_bias_update = False
+
+    def update_moe_biases(self) -> None:
+        for m in self.modules():
+            if isinstance(m, MoELayer):
+                m.update_routing_bias()
 
     @torch.no_grad()
-    def generate(self, input_ids: torch.Tensor, max_new_tokens: int = 256, temperature: float = 0.7, top_p: float = 0.9) -> torch.Tensor:
+    def generate(
+        self,
+        input_ids: torch.Tensor,
+        max_new_tokens: int = 256,
+        temperature: float = 0.7,
+        top_p: float = 0.9,
+        use_cache: bool = True,
+        eos_token_id: Optional[int | list[int]] = None,
+    ) -> torch.Tensor:
         self.eval()
         if self.cfg.mtp_enabled:
-            return self._generate_speculative(input_ids, max_new_tokens, temperature, top_p)
+            return self._generate_speculative(
+                input_ids,
+                max_new_tokens=max_new_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                eos_token_id=eos_token_id,
+            )
         generated = input_ids
         kv_caches = None
         next_input = input_ids
+        eos_set: set[int] = set()
+        if eos_token_id is not None:
+            if isinstance(eos_token_id, int):
+                eos_set.add(eos_token_id)
+            elif isinstance(eos_token_id, (list, tuple, set)):
+                eos_set.update(eos_token_id)
+
+        unfinished = torch.ones(input_ids.shape[0], dtype=torch.bool, device=input_ids.device)
+
         for _ in range(max_new_tokens):
-            logits, kv_caches = self(next_input, kv_caches=kv_caches)
+            if use_cache:
+                logits, kv_caches = self(next_input, kv_caches=kv_caches)
+            else:
+                logits, _ = self(generated)
             next_token_logits = logits[:, -1, :]
             if temperature <= 0:
                 next_token = next_token_logits.argmax(dim=-1, keepdim=True)
             else:
                 probs = F.softmax(next_token_logits / temperature, dim=-1)
                 next_token = self._sample_top_p(probs, top_p)
+
+            # If EOS is provided, check termination
+            if eos_set:
+                is_eos = torch.zeros_like(unfinished)
+                for eid in eos_set:
+                    is_eos = is_eos | (next_token.squeeze(-1) == eid)
+                unfinished = unfinished & (~is_eos)
+
             generated = torch.cat((generated, next_token), dim=1)
             next_input = next_token
+
+            if eos_set and not unfinished.any():
+                break
+
         return generated
 
     def _pick_token(self, logits: torch.Tensor, temperature: float, top_p: float) -> torch.Tensor:
@@ -836,7 +958,12 @@ class GirivinityModel(nn.Module):
 
     @torch.no_grad()
     def _generate_speculative(
-        self, input_ids: torch.Tensor, max_new_tokens: int, temperature: float, top_p: float
+        self,
+        input_ids: torch.Tensor,
+        max_new_tokens: int,
+        temperature: float,
+        top_p: float,
+        eos_token_id: Optional[int | list[int]] = None,
     ) -> torch.Tensor:
         """
         Single-step speculative decoding using MTP-1 as a free draft model.
@@ -882,6 +1009,13 @@ class GirivinityModel(nn.Module):
         generated = input_ids
         remaining = max_new_tokens
 
+        eos_set: set[int] = set()
+        if eos_token_id is not None:
+            if isinstance(eos_token_id, int):
+                eos_set.add(eos_token_id)
+            elif isinstance(eos_token_id, (list, tuple, set)):
+                eos_set.update(eos_token_id)
+
         logits, mtp_logits, kv_caches = self(generated)
 
         while remaining > 0:
@@ -889,7 +1023,7 @@ class GirivinityModel(nn.Module):
             y_next = self._pick_token(main_last, temperature, top_p)
             generated = torch.cat((generated, y_next), dim=1)
             remaining -= 1
-            if remaining == 0:
+            if remaining == 0 or (eos_set and any(tok.item() in eos_set for tok in y_next.reshape(-1))):
                 break
 
             mtp1_last = mtp_logits[0][:, -1, :]
@@ -917,7 +1051,7 @@ class GirivinityModel(nn.Module):
 
             generated = torch.cat((generated, y_confirmed), dim=1)
             remaining -= 1
-            if remaining == 0:
+            if remaining == 0 or (eos_set and any(tok.item() in eos_set for tok in y_confirmed.reshape(-1))):
                 break
 
             if bool(accept.all()):
@@ -961,6 +1095,38 @@ class GirivinityModel(nn.Module):
 
     def count_parameters(self) -> int:
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
+
+    def count_active_parameters(self) -> int:
+        """Count unique parameters that are active during execution of a single token.
+
+        For MoE layers, only top-k routed experts and shared experts are active;
+        inactive experts are not computed for that token.
+        """
+        unique_dense = set()
+        for module in [self.embed, self.norm, self.lm_head]:
+            for p in module.parameters():
+                if p.requires_grad:
+                    unique_dense.add(p)
+        if self.ple is not None:
+            for p in self.ple.parameters():
+                if p.requires_grad:
+                    unique_dense.add(p)
+        if self.mhc is not None:
+            for p in self.mhc.parameters():
+                if p.requires_grad:
+                    unique_dense.add(p)
+        if self.mtp_modules is not None:
+            for p in self.mtp_modules.parameters():
+                if p.requires_grad:
+                    unique_dense.add(p)
+
+        dense_total = sum(p.numel() for p in unique_dense)
+        layers_active = sum(layer.count_active_parameters() for layer in self.layers)
+        return dense_total + layers_active
+
+    def count_inactive_parameters(self) -> int:
+        """Count parameters that are in the model but inactive for a single token."""
+        return self.count_parameters() - self.count_active_parameters()
 
     def param_count_detailed(self) -> dict[str, str]:
         n = sum(p.numel() for p in self.parameters())
