@@ -1,0 +1,101 @@
+{
+  "schema_version": "1.0",
+  "overall_status": "PASS",
+  "environment": {
+    "timestamp_utc": "2026-11-26T10:41:41.597371+00:00",
+    "python_version": "3.14.5",
+    "torch_version": "not_installed",
+    "platform": "Windows-11-10.0.26200-SP0",
+    "commit_sha": "unavailable (detached/no-git-repo)",
+    "mode": "sandbox"
+  },
+  "executed_suites": [
+    {
+      "name": "k3_api_security",
+      "category": "security",
+      "file": "tests/test_api_security.py",
+      "command": "C:\\Users\\Aayush\\AppData\\Local\\Programs\\Python\\Python314\\python.exe -m unittest tests/test_api_security.py -v",
+      "exit_code": 0,
+      "status": "PASS",
+      "counts": {
+        "executed": 20,
+        "passed": 20,
+        "failed": 0,
+        "errors": 0,
+        "skipped": 0
+      },
+      "raw_output": "test_authenticate_admin_key (tests.test_api_security.TestApiAuthMechanisms.test_authenticate_admin_key) ... ok\ntest_authenticate_service_key (tests.test_api_security.TestApiAuthMechanisms.test_authenticate_service_key) ... ok\ntest_authenticate_user_key (tests.test_api_security.TestApiAuthMechanisms.test_authenticate_user_key) ... ok\ntest_extract_credential_bearer (tests.test_api_security.TestApiAuthMechanisms.test_extract_credential_bearer) ... ok\ntest_extract_credential_malformed_bearer (tests.test_api_security.TestApiAuthMechanisms.test_extract_credential_malformed_bearer) ... ok\ntest_extract_credential_none (tests.test_api_security.TestApiAuthMechanisms.test_extract_credential_none) ... ok\ntest_extract_credential_x_api_key (tests.test_api_security.TestApiAuthMechanisms.test_extract_credential_x_api_key) ... ok\ntest_extract_credential_x_rasp_key (tests.test_api_security.TestApiAuthMechanisms.test_extract_credential_x_rasp_key) ... ok\ntest_forbidden_default_placeholder_keys_rejected (tests.test_api_security.TestApiAuthMechanisms.test_forbidden_default_placeholder_keys_rejected) ... ok\ntest_revoked_key_rejected (tests.test_api_security.TestApiAuthMechanisms.test_revoked_key_rejected) ... ok\ntest_public_chat_rate_limiting (tests.test_api_security.TestRolePolicyDependencies.test_public_chat_rate_limiting) ... ok\ntest_require_admin_forbidden_for_service_role (tests.test_api_security.TestRolePolicyDependencies.test_require_admin_forbidden_for_service_role) ... ok\ntest_require_admin_forbidden_for_user_role (tests.test_api_security.TestRolePolicyDependencies.test_require_admin_forbidden_for_user_role) ... ok\ntest_require_admin_missing_credentials (tests.test_api_security.TestRolePolicyDependencies.test_require_admin_missing_credentials) ... ok\ntest_require_admin_success (tests.test_api_security.TestRolePolicyDependencies.test_require_admin_success) ... ok\ntest_require_authenticated_user_allows_user (tests.test_api_security.TestRolePolicyDependencies.test_require_authenticated_user_allows_user) ... ok\ntest_require_service_or_admin_allows_service_and_admin (tests.test_api_security.TestRolePolicyDependencies.test_require_service_or_admin_allows_service_and_admin) ... ok\ntest_all_live_routes_are_classified (tests.test_api_security.TestRouteInventory.test_all_live_routes_are_classified) ... ok\ntest_no_phantom_routes_in_classification (tests.test_api_security.TestRouteInventory.test_no_phantom_routes_in_classification) ... ok\ntest_privileged_routes_have_authorization_dependencies (tests.test_api_security.TestRouteInventory.test_privileged_routes_have_authorization_dependencies)\nVerify that every route classified as privileged attaches security dependencies. ... ok\n\n----------------------------------------------------------------------\nRan 20 tests in 0.020s\n\nOK"
+    },
+    {
+      "name": "k4_training_data",
+      "category": "cpu_correctness",
+      "file": "tests/test_k4_training_data.py",
+      "command": "C:\\Users\\Aayush\\AppData\\Local\\Programs\\Python\\Python314\\python.exe -m unittest tests/test_k4_training_data.py -v",
+      "exit_code": 0,
+      "status": "PASS",
+      "counts": {
+        "executed": 6,
+        "passed": 6,
+        "failed": 0,
+        "errors": 0,
+        "skipped": 0
+      },
+      "raw_output": "test_bos_eos_data_boundary_policy (tests.test_k4_training_data.TestK4DataAndTrainingCorrectness.test_bos_eos_data_boundary_policy) ... ok\ntest_instruction_collate_next_token_and_ignore_index (tests.test_k4_training_data.TestK4DataAndTrainingCorrectness.test_instruction_collate_next_token_and_ignore_index) ... ok\ntest_model_train_gradient_accumulation_remainder_flush (tests.test_k4_training_data.TestK4DataAndTrainingCorrectness.test_model_train_gradient_accumulation_remainder_flush)\nVerify that remainder accumulation at epoch end does not drop gradients or leak to next epoch. ... ok\ntest_streaming_packed_dataset_and_source_level_split (tests.test_k4_training_data.TestK4DataAndTrainingCorrectness.test_streaming_packed_dataset_and_source_level_split) ... ok\ntest_tokenizer_model_vocab_equality_enforced (tests.test_k4_training_data.TestK4DataAndTrainingCorrectness.test_tokenizer_model_vocab_equality_enforced) ... ok\ntest_train_seq_len_parsed_and_validated_from_yaml (tests.test_k4_training_data.TestK4DataAndTrainingCorrectness.test_train_seq_len_parsed_and_validated_from_yaml) ... ok\n\n----------------------------------------------------------------------\nRan 6 tests in 0.024s\n\nOK"
+    },
+    {
+      "name": "k5_checkpoints_and_gates",
+      "category": "checkpoint_and_gates",
+      "file": "tests/test_k5_checkpoints_and_gates.py",
+      "command": "C:\\Users\\Aayush\\AppData\\Local\\Programs\\Python\\Python314\\python.exe -m unittest tests/test_k5_checkpoints_and_gates.py -v",
+      "exit_code": 0,
+      "status": "PASS",
+      "counts": {
+        "executed": 4,
+        "passed": 4,
+        "failed": 0,
+        "errors": 0,
+        "skipped": 0
+      },
+      "raw_output": "test_atomic_checkpoint_write_and_resume_equivalence (tests.test_k5_checkpoints_and_gates.TestK5CheckpointsAndDistributedGates.test_atomic_checkpoint_write_and_resume_equivalence)\nSimulate deterministic training updates and resume-equivalence. ... ok\ntest_canonical_checkpoint_layout_interoperability (tests.test_k5_checkpoints_and_gates.TestK5CheckpointsAndDistributedGates.test_canonical_checkpoint_layout_interoperability)\nVerify that loader, quantizer, and native trainer interoperate on model.pt + config.yaml. ... ok\ntest_fsdp_fails_closed_when_uninitialized (tests.test_k5_checkpoints_and_gates.TestK5CheckpointsAndDistributedGates.test_fsdp_fails_closed_when_uninitialized)\nIf use_fsdp=True but torch.distributed is uninitialized, pretrainer MUST fail closed. ... INFO:app.training.pretrain:Training on CPU \u2014 this will be slow, consider a GPU instance\nok\ntest_preflight_feasibility_guard_and_parameter_profile (tests.test_k5_checkpoints_and_gates.TestK5CheckpointsAndDistributedGates.test_preflight_feasibility_guard_and_parameter_profile)\nVerify allocation-free parameter and static memory computation. ... ok\n\n----------------------------------------------------------------------\nRan 4 tests in 0.045s\n\nOK"
+    },
+    {
+      "name": "k6_evidence_and_ci",
+      "category": "ci_evidence",
+      "file": "tests/test_k6_evidence_and_ci.py",
+      "command": "C:\\Users\\Aayush\\AppData\\Local\\Programs\\Python\\Python314\\python.exe -m unittest tests/test_k6_evidence_and_ci.py -v",
+      "exit_code": 0,
+      "status": "PASS",
+      "counts": {
+        "executed": 2,
+        "passed": 2,
+        "failed": 0,
+        "errors": 0,
+        "skipped": 0
+      },
+      "raw_output": "test_health_deep_reports_truthful_model_status (tests.test_k6_evidence_and_ci.TestK6EvidenceAndCI.test_health_deep_reports_truthful_model_status) ... ok\ntest_parse_unittest_counts_zero_tests_and_skips (tests.test_k6_evidence_and_ci.TestK6EvidenceAndCI.test_parse_unittest_counts_zero_tests_and_skips) ... ok\n\n----------------------------------------------------------------------\nRan 2 tests in 0.790s\n\nOK"
+    }
+  ],
+  "blocked_or_not_run": [
+    {
+      "name": "cuda_engine",
+      "category": "optional_cuda_fsdp_performance",
+      "file": "tests/test_cuda_engine.py",
+      "status": "BLOCKED",
+      "reason": "Requires CUDA GPU hardware (not available in CPU-only runner/sandbox)."
+    },
+    {
+      "name": "multi_rank_fsdp_checkpoint_resume",
+      "category": "optional_cuda_fsdp_performance",
+      "file": "tests/test_k5_checkpoints_and_gates.py",
+      "status": "BLOCKED",
+      "reason": "Requires multi-GPU torch.distributed process group."
+    },
+    {
+      "name": "github_actions_remote_execution",
+      "category": "ci_workflow",
+      "file": ".github/workflows/ci.yml",
+      "status": "NOT RUN",
+      "reason": "Workflow file authored locally; remote execution occurs only when GitHub Actions runs it."
+    }
+  ]
+}

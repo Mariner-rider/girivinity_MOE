@@ -67,7 +67,7 @@ the response. Girivinity is not that.
 
 **It owns its own model.** The GirivinityModel is a decoder-only transformer
 built from scratch in PyTorch — RMSNorm, Rotary Position Embeddings, Grouped
-Query Attention, SwiGLU feed-forward, weight-tied LM head. The model family starts at 3B parameters (Girivinity-3B), scaling to 70B and beyond through the structured generation roadmap.
+Query Attention, SwiGLU feed-forward, weight-tied LM head. The active default `config.yaml` defines a ~34.62B total (~5.06B active-per-token) MoE architecture (with smaller Option B / 3B-class presets configurable). **No trained checkpoint is shipped by default** — pretraining must be run to produce `models/base/final/model.pt`, and `max_seq_len: 32768` is an architectural limit, not a verified 32K trained-context claim.
 Quantised to Q4_K_M GGUF for CPU inference on a standard VPS.
 
 **It learns while it runs.** Every query that misses the knowledge base
@@ -531,10 +531,7 @@ Experts in later layers — fine-grained routed experts plus always-active
 shared experts, auxiliary-loss-free load balancing, DeepSeek-MoE/V3
 style), optional cross-layer KV-sharing, optional per-layer embeddings
 (PLE), optional manifold-constrained hyper-connections (mHC) for multi-
-stream residual mixing, weight-tied LM head. The model family starts at
-3B parameters (Girivinity-3B), scaling to 70B and beyond through the
-structured generation roadmap. KV-cache supported for fast autoregressive
-inference. **GGUF export is not currently functional — see the warning in
+stream residual mixing, weight-tied LM head. The active default `config.yaml` specifies ~34.62B total parameters (~5.06B active per token), while smaller presets (e.g., 3B-class) are supported in configuration. KV-cache is supported for autoregressive inference; `max_seq_len: 32768` is the configured architectural maximum and does not imply 32K trained-context evaluation. **GGUF export is not currently functional — see the warning in
 Deployment Guide Step 7.**
 
 ---

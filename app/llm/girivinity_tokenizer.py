@@ -22,7 +22,7 @@ class GirivinityTokenizer:
     def train(
         self,
         corpus_files: list[str],
-        vocab_size: int = 100000,
+        vocab_size: int = 65536,
         min_frequency: int = 2,
         output_path: str = "girivinity_tokenizer/",
     ) -> None:

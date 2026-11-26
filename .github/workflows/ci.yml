@@ -1,0 +1,115 @@
+name: Girivinity CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  lint-and-compile:
+    name: Lint and Compile Checks
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install lint dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install ruff==0.6.9
+
+      - name: Run ruff lint
+        run: ruff check app/ model/ llm_loader.py llm_engine.py tests/test_api_security.py tests/test_k4_training_data.py tests/test_k5_checkpoints_and_gates.py
+
+      - name: Compile-check Python sources
+        run: python -m compileall -q app model llm_loader.py llm_engine.py scripts
+
+  cpu-unit-and-security:
+    name: CPU Correctness, Security & Checkpoint Gates
+    runs-on: ubuntu-latest
+    needs: lint-and-compile
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install CPU test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install --index-url https://download.pytorch.org/whl/cpu torch>=2.3.0
+          pip install fastapi>=0.115.0 pydantic>=2.8.0 pydantic-settings>=2.4.0 pyyaml>=6.0.1 httpx>=0.27.0 pytest>=8.2.0 numpy>=1.26.0
+
+      - name: Run required CPU suites and generate fail-closed evidence
+        run: |
+          python scripts/generate_test_evidence.py --mode ci --output-json reports/test_evidence.json --output-md reports/remediation_evidence.md
+
+      - name: Upload test evidence report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cpu-test-evidence
+          path: |
+            reports/test_evidence.json
+            reports/remediation_evidence.md
+
+  integration-db-api:
+    name: Integration Tests (PostgreSQL + API)
+    runs-on: ubuntu-latest
+    needs: lint-and-compile
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: girivinity
+          POSTGRES_PASSWORD: test_password
+          POSTGRES_DB: girivinity_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install integration dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]" psycopg2-binary>=2.9.9
+
+      - name: Run integration tests
+        env:
+          DATABASE_URL: postgresql://girivinity:test_password@localhost:5432/girivinity_test
+        run: pytest -m integration -v
+
+  gpu-fsdp-performance:
+    name: Optional CUDA / Multi-Rank FSDP (Self-Hosted GPU)
+    runs-on: [self-hosted, gpu]
+    if: github.event_name == 'workflow_dispatch'
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Run CUDA and FSDP verification
+        run: |
+          python -m pytest tests/test_cuda_engine.py -v

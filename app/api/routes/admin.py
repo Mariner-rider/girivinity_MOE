@@ -1,10 +1,11 @@
 from __future__ import annotations
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 
 from app.core.successor_engine import SuccessorEngine
+from app.security.api_auth import Principal, get_correlation_id, log_audit_event, require_admin
 
-router = APIRouter(prefix="/admin", tags=["admin"])
+router = APIRouter(prefix="/admin", tags=["admin"], dependencies=[Depends(require_admin)])
 
 
 class FeedbackRequest(BaseModel):
@@ -18,8 +19,15 @@ async def get_notifications():
 
 
 @router.post("/approve-successor/{version}")
-async def approve_successor(version: str):
+async def approve_successor(version: str, request: Request, principal: Principal = Depends(require_admin)):
     ok = SuccessorEngine().approve_successor(version)
+    log_audit_event(
+        principal=principal,
+        action="admin.approve_successor",
+        target=f"/admin/approve-successor/{version}",
+        result="approved" if ok else "not_found",
+        correlation_id=get_correlation_id(request),
+    )
     if not ok:
         raise HTTPException(
             status_code=404, detail=f"Version {version} not found"
@@ -28,8 +36,15 @@ async def approve_successor(version: str):
 
 
 @router.post("/reject-successor/{version}")
-async def reject_successor(version: str):
+async def reject_successor(version: str, request: Request, principal: Principal = Depends(require_admin)):
     SuccessorEngine().reject_successor(version)
+    log_audit_event(
+        principal=principal,
+        action="admin.reject_successor",
+        target=f"/admin/reject-successor/{version}",
+        result="rejected",
+        correlation_id=get_correlation_id(request),
+    )
     return {"status": "rejected", "version": version}
 
 
@@ -49,10 +64,17 @@ async def list_model_versions():
 
 
 @router.post("/feedback")
-async def submit_feedback(req: FeedbackRequest):
+async def submit_feedback(req: FeedbackRequest, request: Request, principal: Principal = Depends(require_admin)):
     if not 1.0 <= req.score <= 5.0:
         raise HTTPException(
             status_code=400, detail="Score must be between 1.0 and 5.0"
         )
     SuccessorEngine().log_feedback(req.user_id, req.score)
+    log_audit_event(
+        principal=principal,
+        action="admin.submit_feedback",
+        target="/admin/feedback",
+        result="recorded",
+        correlation_id=get_correlation_id(request),
+    )
     return {"status": "recorded"}

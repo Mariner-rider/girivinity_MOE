@@ -1,8 +1,15 @@
 from __future__ import annotations
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 
 from app.core.cuda_engine import CUDAEngine
+from app.security.api_auth import (
+    Principal,
+    get_correlation_id,
+    log_audit_event,
+    require_admin,
+    require_authenticated_user,
+)
 
 router = APIRouter(prefix="/cuda", tags=["cuda"])
 
@@ -17,7 +24,7 @@ class BenchmarkRequest(BaseModel):
     kernel_code: str
 
 
-@router.post("/generate")
+@router.post("/generate", dependencies=[Depends(require_authenticated_user)])
 async def generate_kernel(req: KernelRequest):
     if not req.request.strip():
         raise HTTPException(status_code=400, detail="Request cannot be empty")
@@ -40,7 +47,7 @@ async def generate_kernel(req: KernelRequest):
         raise HTTPException(status_code=500, detail=str(exc))
 
 
-@router.post("/benchmark")
+@router.post("/benchmark", dependencies=[Depends(require_authenticated_user)])
 async def benchmark_kernel(req: BenchmarkRequest):
     if not req.kernel_code.strip():
         raise HTTPException(status_code=400, detail="Kernel code required")
@@ -54,7 +61,7 @@ async def benchmark_kernel(req: BenchmarkRequest):
     }
 
 
-@router.get("/types")
+@router.get("/types", dependencies=[Depends(require_authenticated_user)])
 async def list_kernel_types():
     from app.core.cuda_engine import KERNEL_PATTERNS, KERNEL_TEMPLATES
 
@@ -62,9 +69,19 @@ async def list_kernel_types():
 
 
 @router.post("/bootstrap")
-async def bootstrap_cuda_knowledge():
+async def bootstrap_cuda_knowledge(
+    request: Request,
+    principal: Principal = Depends(require_admin),
+):
     """Trigger CUDA knowledge base crawl in background."""
     from app.core.cuda_crawler import CUDACrawler
 
     CUDACrawler().bootstrap_async()
+    log_audit_event(
+        principal=principal,
+        action="cuda.bootstrap",
+        target="/cuda/bootstrap",
+        result="bootstrapping",
+        correlation_id=get_correlation_id(request),
+    )
     return {"status": "bootstrapping", "sources": len([]), "topics": 12}

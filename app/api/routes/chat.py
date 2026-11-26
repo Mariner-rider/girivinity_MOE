@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import logging
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from app.core.query_router import QueryRouter
 from app.core.llm_synthesiser import LLMSynthesiser
+from app.security.api_auth import enforce_public_chat_rate_limit
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/chat", tags=["chat"])
@@ -26,7 +27,7 @@ class ChatResponse(BaseModel):
     urls: list[str]
 
 
-@router.post("/message", response_model=ChatResponse)
+@router.post("/message", response_model=ChatResponse, dependencies=[Depends(enforce_public_chat_rate_limit)])
 async def chat_message(req: ChatRequest):
     if not req.query.strip():
         raise HTTPException(status_code=400, detail="Query cannot be empty")
@@ -72,7 +73,7 @@ async def chat_message(req: ChatRequest):
     )
 
 
-@router.post("/message/stream")
+@router.post("/message/stream", dependencies=[Depends(enforce_public_chat_rate_limit)])
 async def chat_message_stream(req: ChatRequest):
     """Streaming version — yields answer tokens as they are built."""
     if not req.query.strip():

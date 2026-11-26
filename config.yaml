@@ -41,7 +41,7 @@ model:
   trust_remote_code: false
   attn_implementation: "flash_attention_2"
 
-  # Architecture (3B spec, matches model/architecture.py's verified defaults)
+  # Architecture (~34.62B total / ~5.06B active per token MoE preset; see Option B below for 3B-class)
   architecture:
     vocab_size: 65536
     max_seq_len: 32768

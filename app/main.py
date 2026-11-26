@@ -2,7 +2,7 @@ import logging
 from contextlib import asynccontextmanager
 from typing import Any
 
-from fastapi import FastAPI, Request
+from fastapi import Depends, FastAPI, Request
 from fastapi.responses import JSONResponse, Response
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 
@@ -18,6 +18,15 @@ from app.api.routes.chat import router as chat_router
 from app.api.routes.health import router as health_router
 from app.api.routes.skills import router as skills_router
 from app.api.routes.cuda import router as cuda_router
+from app.security.api_auth import (
+    Principal,
+    enforce_public_chat_rate_limit,
+    get_correlation_id,
+    log_audit_event,
+    require_admin,
+    require_authenticated_user,
+    require_service_or_admin,
+)
 from app.security.rasp import RASPEngine
 from app.security.rasp_api import rasp_router
 
@@ -67,8 +76,11 @@ def _start_self_trainer_once() -> None:
 
 @app.middleware("http")
 async def metrics_middleware(request: Request, call_next):
+    corr_id = get_correlation_id(request)
     REQUEST_COUNTER.labels(path=request.url.path, method=request.method).inc()
-    return await call_next(request)
+    response = await call_next(request)
+    response.headers["X-Request-ID"] = corr_id
+    return response
 
 
 @app.get("/health")
@@ -82,13 +94,13 @@ def health() -> JSONResponse:
     )
 
 
-@app.get("/modules")
+@app.get("/modules", dependencies=[Depends(require_service_or_admin)])
 def modules() -> JSONResponse:
     config = _llm_runtime.get("config") or get_system_config()
     return JSONResponse({"modules": config.get("modules", {})})
 
 
-@app.get("/metrics")
+@app.get("/metrics", dependencies=[Depends(require_service_or_admin)])
 def metrics() -> Response:
     return Response(content=generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
@@ -113,7 +125,7 @@ def _ndjson_stream(text: str):
     yield _json.dumps({"token": "", "done": True}) + "\n"
 
 
-@app.post("/v1/chat")
+@app.post("/v1/chat", dependencies=[Depends(enforce_public_chat_rate_limit)])
 async def v1_chat(text: str = Form(...), image: UploadFile | None = File(None), audio: UploadFile | None = File(None), video: UploadFile | None = File(None), user_id: str | None = Form(None)):
     from app.cognition.sentiment_engine import SentimentEngine
     sentiment = SentimentEngine().analyze(text)
@@ -143,7 +155,7 @@ async def v1_chat(text: str = Form(...), image: UploadFile | None = File(None), 
                 "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
             }
 
-@app.post("/v1/analyze/code")
+@app.post("/v1/analyze/code", dependencies=[Depends(require_authenticated_user)])
 async def v1_analyze_code(payload: dict = Body(...)):
     code = payload.get("code", "")
     findings = []
@@ -153,7 +165,7 @@ async def v1_analyze_code(payload: dict = Body(...)):
     return {"findings": findings, "severity": severity, "mitigations": ["Validate input", "Avoid dynamic execution", "Run static analysis in CI"]}
 
 
-@app.post("/v1/analyze/threat")
+@app.post("/v1/analyze/threat", dependencies=[Depends(require_authenticated_user)])
 async def v1_analyze_threat(payload: dict = Body(...)):
     import re
     text = payload.get("text", "")
@@ -164,12 +176,12 @@ async def v1_analyze_threat(payload: dict = Body(...)):
     return {"cves": cves, "techniques": techniques, "iocs": iocs, "risk_score": risk, "report": f"Detected {len(cves)} CVEs, {len(techniques)} ATT&CK techniques, and {len(iocs)} IOCs."}
 
 
-@app.get("/v1/cve/{cve_id}")
+@app.get("/v1/cve/{cve_id}", dependencies=[Depends(require_authenticated_user)])
 async def v1_cve(cve_id: str):
     return {"id": cve_id.upper(), "source": "NVD", "status": "lookup_unavailable_offline", "url": f"https://nvd.nist.gov/vuln/detail/{cve_id.upper()}"}
 
 
-@app.post("/v1/cve/search")
+@app.post("/v1/cve/search", dependencies=[Depends(require_authenticated_user)])
 async def v1_cve_search(payload: dict = Body(...)):
     return {
         "results": [],
@@ -178,12 +190,12 @@ async def v1_cve_search(payload: dict = Body(...)):
     }
 
 
-@app.get("/v1/mitre/{technique_id}")
+@app.get("/v1/mitre/{technique_id}", dependencies=[Depends(require_authenticated_user)])
 async def v1_mitre(technique_id: str):
     return {"technique_id": technique_id.upper(), "url": f"https://attack.mitre.org/techniques/{technique_id.upper().replace('.', '/')}/", "name": "ATT&CK technique record"}
 
 
-@app.post("/v1/ioc/check")
+@app.post("/v1/ioc/check", dependencies=[Depends(require_authenticated_user)])
 async def v1_ioc_check(payload: dict = Body(...)):
     import re
     value = payload.get("value", "")
@@ -191,7 +203,7 @@ async def v1_ioc_check(payload: dict = Body(...)):
     return {"is_ioc": vt in {"hash", "ip", "url", "domain"}, "value_type": vt, "feeds": ["local_regex", "configured_feeds"]}
 
 
-@app.get("/v1/system/status")
+@app.get("/v1/system/status", dependencies=[Depends(require_service_or_admin)])
 async def v1_system_status():
     queue_size, last_cycle, rag_docs = 0, None, 0
     try:
@@ -227,18 +239,18 @@ async def v1_system_status():
         "last_training_cycle": last_cycle,
     }
 
-@app.get("/v1/system/metrics")
+@app.get("/v1/system/metrics", dependencies=[Depends(require_service_or_admin)])
 async def v1_system_metrics():
     return PlainTextResponse(generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
 
-@app.get("/v1/training/status")
+@app.get("/v1/training/status", dependencies=[Depends(require_service_or_admin)])
 async def v1_training_status():
     return {"self_improvement_loop": {"available": True}, "successor_engine": {"available": True}}
 
 
 @app.post("/v1/training/trigger")
-async def v1_training_trigger():
+async def v1_training_trigger(request: Request, principal: Principal = Depends(require_admin)):
     from starlette.concurrency import run_in_threadpool
 
     from app.core.self_trainer import SelfTrainer
@@ -249,14 +261,32 @@ async def v1_training_trigger():
         return 0
 
     await run_in_threadpool(_run)
+    log_audit_event(
+        principal=principal,
+        action="training.trigger",
+        target="/v1/training/trigger",
+        result="triggered",
+        correlation_id=get_correlation_id(request),
+    )
     return {"training_triggered": True, "finished_at": _time.time()}
 
 
 @app.post("/v1/feedback")
-async def v1_feedback(payload: dict = Body(...)):
+async def v1_feedback(
+    request: Request,
+    payload: dict = Body(...),
+    principal: Principal = Depends(require_authenticated_user),
+):
     if FeedbackHarvester is None:
         return {"stored": False, "reason": "FeedbackHarvester unavailable"}
     FeedbackHarvester().collect_explicit(payload["interaction_id"], int(payload["rating"]), payload.get("correction"), payload.get("user_id"))
+    log_audit_event(
+        principal=principal,
+        action="feedback.collect",
+        target="/v1/feedback",
+        result="stored",
+        correlation_id=get_correlation_id(request),
+    )
     return {"stored": True}
 
 # --- adaptive agent platform endpoints --------------------------------------
@@ -289,20 +319,24 @@ def _get_adaptive_executor():
     return _adaptive_runtime["adaptive_executor"]
 
 
-@app.get("/v1/agents")
+@app.get("/v1/agents", dependencies=[Depends(require_authenticated_user)])
 async def v1_agents_list():
     registry = _get_agent_registry()
     return {"agents": [agent.to_dict() for agent in registry.list_all()]}
 
 
-@app.get("/v1/agents/search")
+@app.get("/v1/agents/search", dependencies=[Depends(require_authenticated_user)])
 async def v1_agents_search(q: str = Query(..., min_length=1)):
     registry = _get_agent_registry()
     return {"query": q, "agents": [agent.to_dict() for agent in registry.search(q)]}
 
 
 @app.post("/v1/agents")
-async def v1_agents_register(payload: dict = Body(...)):
+async def v1_agents_register(
+    request: Request,
+    payload: dict = Body(...),
+    principal: Principal = Depends(require_admin),
+):
     from app.agents.agent_registry import AgentTypeDefinition
 
     required = ["agent_type_id", "display_name", "description", "base_system_prompt"]
@@ -322,10 +356,17 @@ async def v1_agents_register(payload: dict = Body(...)):
         tags=[str(tag).lower() for tag in payload.get("tags", [])],
     )
     registry.register(agent_def)
+    log_audit_event(
+        principal=principal,
+        action="agents.register",
+        target=f"/v1/agents/{agent_def.agent_type_id}",
+        result="registered",
+        correlation_id=get_correlation_id(request),
+    )
     return {"registered": True, "agent": agent_def.to_dict()}
 
 
-@app.get("/v1/agents/{agent_type_id}")
+@app.get("/v1/agents/{agent_type_id}", dependencies=[Depends(require_authenticated_user)])
 async def v1_agents_get(agent_type_id: str):
     registry = _get_agent_registry()
     agent = registry.get(agent_type_id)
@@ -335,19 +376,32 @@ async def v1_agents_get(agent_type_id: str):
 
 
 @app.post("/v1/agents/{agent_type_id}/run")
-async def v1_agents_run(agent_type_id: str, payload: dict = Body(...)):
+async def v1_agents_run(
+    agent_type_id: str,
+    request: Request,
+    payload: dict = Body(...),
+    principal: Principal = Depends(require_authenticated_user),
+):
     user_id = payload.get("user_id")
     task = payload.get("task")
     if not user_id or not task:
         raise HTTPException(status_code=422, detail="user_id and task are required")
     executor = _get_adaptive_executor()
     try:
-        return await executor.execute(agent_type_id, str(user_id), str(task), payload.get("user_context"))
+        res = await executor.execute(agent_type_id, str(user_id), str(task), payload.get("user_context"))
+        log_audit_event(
+            principal=principal,
+            action="agents.run",
+            target=f"/v1/agents/{agent_type_id}/run",
+            result="executed",
+            correlation_id=get_correlation_id(request),
+        )
+        return res
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
-@app.get("/v1/agents/{agent_type_id}/stats")
+@app.get("/v1/agents/{agent_type_id}/stats", dependencies=[Depends(require_authenticated_user)])
 async def v1_agents_stats(agent_type_id: str):
     registry = _get_agent_registry()
     try:
@@ -357,7 +411,12 @@ async def v1_agents_stats(agent_type_id: str):
 
 
 @app.post("/v1/agents/{agent_type_id}/feedback")
-async def v1_agents_feedback(agent_type_id: str, payload: dict = Body(...)):
+async def v1_agents_feedback(
+    agent_type_id: str,
+    request: Request,
+    payload: dict = Body(...),
+    principal: Principal = Depends(require_admin),
+):
     registry = _get_agent_registry()
     if registry.get(agent_type_id) is None:
         raise HTTPException(status_code=404, detail=f"Unknown agent type: {agent_type_id}")
@@ -382,4 +441,11 @@ async def v1_agents_feedback(agent_type_id: str, payload: dict = Body(...)):
     )
     if FeedbackHarvester is not None:
         FeedbackHarvester().collect_explicit(interaction_id, rating, correction or None, user_id)
+    log_audit_event(
+        principal=principal,
+        action="agents.feedback",
+        target=f"/v1/agents/{agent_type_id}/feedback",
+        result="stored",
+        correlation_id=get_correlation_id(request),
+    )
     return {"stored": True, "delta_id": delta_id, "agent_type": agent_type_id, "rating": rating}

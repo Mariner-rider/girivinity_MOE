@@ -9,10 +9,17 @@ import time
 from pathlib import Path
 from typing import Any
 
-from fastapi import APIRouter, Header, HTTPException, Request
+from fastapi import APIRouter, Depends, Header, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, HttpUrl
 
+from app.security.api_auth import (
+    Principal,
+    get_correlation_id,
+    log_audit_event,
+    require_admin,
+    require_service_or_admin,
+)
 from app.security.rasp import RASPEngine, RASPEvent
 
 rasp_router = APIRouter(prefix="/rasp/v1", tags=["RASP"])
@@ -59,11 +66,13 @@ def get_rasp_engine(request: Request) -> RASPEngine:
 
 
 def validate_api_key(x_rasp_key: str | None = Header(default=None, alias="X-RASP-Key")) -> str:
+    import hmac
+
     valid_keys = [key.strip() for key in os.environ.get("RASP_API_KEYS", "").split(",") if key.strip()]
-    if valid_keys and x_rasp_key in valid_keys:
-        return str(x_rasp_key)
-    if not valid_keys and os.environ.get("ENVIRONMENT", "development").lower() in {"dev", "development", "test"}:
-        return x_rasp_key or "development"
+    if valid_keys and x_rasp_key:
+        for key in valid_keys:
+            if hmac.compare_digest(x_rasp_key.encode("utf-8"), key.encode("utf-8")):
+                return str(x_rasp_key)
     raise HTTPException(status_code=401, detail="Invalid RASP API key")
 
 
@@ -85,12 +94,15 @@ def _response(text: str, events: list[RASPEvent], blocked: bool, processing_ms: 
 
 
 @rasp_router.post("/inspect/input", response_model=InspectResponse)
-async def inspect_input(body: InspectInputRequest, request: Request, api_key: str | None = Header(default=None, alias="X-RASP-Key")) -> InspectResponse:
-    key = validate_api_key(api_key)
+async def inspect_input(
+    body: InspectInputRequest,
+    request: Request,
+    principal: Principal = Depends(require_service_or_admin),
+) -> InspectResponse:
     rasp = get_rasp_engine(request)
     source_ip = request.client.host if request.client else "unknown"
     start = time.perf_counter()
-    events = rasp.inspect_input(body.text, client_id=body.client_id or key, source_ip=source_ip, context=body.context)
+    events = rasp.inspect_input(body.text, client_id=body.client_id or principal.principal_id, source_ip=source_ip, context=body.context)
     processing_ms = round((time.perf_counter() - start) * 1000, 2)
     blocked = any(event.blocked for event in events)
     sanitised = "" if blocked else body.text
@@ -100,32 +112,43 @@ async def inspect_input(body: InspectInputRequest, request: Request, api_key: st
 
 
 @rasp_router.post("/inspect/output", response_model=InspectResponse)
-async def inspect_output(body: InspectOutputRequest, request: Request, api_key: str | None = Header(default=None, alias="X-RASP-Key")) -> InspectResponse:
-    key = validate_api_key(api_key)
+async def inspect_output(
+    body: InspectOutputRequest,
+    request: Request,
+    principal: Principal = Depends(require_service_or_admin),
+) -> InspectResponse:
     rasp = get_rasp_engine(request)
     start = time.perf_counter()
-    sanitised_text, events = rasp.inspect_output(body.text, client_id=body.client_id or key, grounded_sources=body.grounded_sources)
+    sanitised_text, events = rasp.inspect_output(body.text, client_id=body.client_id or principal.principal_id, grounded_sources=body.grounded_sources)
     processing_ms = round((time.perf_counter() - start) * 1000, 2)
     return _response(sanitised_text, events, False, processing_ms)
 
 
 @rasp_router.post("/webhooks")
-async def register_webhook(body: WebhookRegistration, api_key: str | None = Header(default=None, alias="X-RASP-Key")) -> dict[str, Any]:
-    validate_api_key(api_key)
+async def register_webhook(
+    body: WebhookRegistration,
+    request: Request,
+    principal: Principal = Depends(require_admin),
+) -> dict[str, Any]:
     _WEBHOOKS.append(body)
+    log_audit_event(
+        principal=principal,
+        action="rasp.register_webhook",
+        target="/rasp/v1/webhooks",
+        result="registered",
+        correlation_id=get_correlation_id(request),
+    )
     return {"registered": True, "webhook_count": len(_WEBHOOKS), "severity_filter": body.severity_filter, "event_types": body.event_types}
 
 
-@rasp_router.get("/threats/summary")
-async def threat_summary(request: Request, hours_back: int = 24, api_key: str | None = Header(default=None, alias="X-RASP-Key")) -> dict[str, Any]:
-    validate_api_key(api_key)
+@rasp_router.get("/threats/summary", dependencies=[Depends(require_service_or_admin)])
+async def threat_summary(request: Request, hours_back: int = 24) -> dict[str, Any]:
     rasp = get_rasp_engine(request)
     return rasp.get_threat_summary(hours_back)
 
 
-@rasp_router.get("/threats/stream")
-async def threat_stream(request: Request, api_key: str | None = Header(default=None, alias="X-RASP-Key")) -> StreamingResponse:
-    validate_api_key(api_key)
+@rasp_router.get("/threats/stream", dependencies=[Depends(require_admin)])
+async def threat_stream(request: Request) -> StreamingResponse:
     rasp = get_rasp_engine(request)
 
     async def generate():

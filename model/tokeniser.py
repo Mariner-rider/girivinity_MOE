@@ -4,7 +4,7 @@ from pathlib import Path
 
 def train_tokeniser(
     corpus_path: str,
-    vocab_size: int = 32000,
+    vocab_size: int = 65536,
     save_path: str = "models/tokeniser",
 ) -> None:
     from tokenizers import Tokenizer, models, trainers, pre_tokenizers

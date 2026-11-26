@@ -1,8 +1,15 @@
 from __future__ import annotations
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 
 from app.core.skill_forge import SkillForge
+from app.security.api_auth import (
+    Principal,
+    get_correlation_id,
+    log_audit_event,
+    require_admin,
+    require_authenticated_user,
+)
 
 router = APIRouter(prefix="/skills", tags=["skills"])
 
@@ -13,12 +20,12 @@ class FeedbackRequest(BaseModel):
     score: float
 
 
-@router.get("/")
+@router.get("/", dependencies=[Depends(require_authenticated_user)])
 async def list_skills():
     return {"skills": SkillForge().list_skills()}
 
 
-@router.get("/{slug}")
+@router.get("/{slug}", dependencies=[Depends(require_authenticated_user)])
 async def get_skill(slug: str):
     skill = SkillForge()._load_skill(slug)
     if not skill:
@@ -38,22 +45,44 @@ async def get_skill(slug: str):
 
 
 @router.post("/feedback")
-async def submit_skill_feedback(req: FeedbackRequest):
+async def submit_skill_feedback(
+    req: FeedbackRequest,
+    request: Request,
+    principal: Principal = Depends(require_authenticated_user),
+):
     if not 1.0 <= req.score <= 5.0:
         raise HTTPException(
             status_code=400, detail="Score must be 1.0-5.0"
         )
     SkillForge().update_skill_feedback(req.skill_slug, req.score)
+    log_audit_event(
+        principal=principal,
+        action="skills.feedback",
+        target=f"/skills/feedback:{req.skill_slug}",
+        result="recorded",
+        correlation_id=get_correlation_id(request),
+    )
     return {"status": "recorded"}
 
 
 @router.post("/{slug}/evaluate")
-async def evaluate_skill(slug: str):
+async def evaluate_skill(
+    slug: str,
+    request: Request,
+    principal: Principal = Depends(require_admin),
+):
     forge = SkillForge()
     skill = forge._load_skill(slug)
     if not skill:
         raise HTTPException(status_code=404, detail="Skill not found")
     result = forge.evaluate_skill(skill)
+    log_audit_event(
+        principal=principal,
+        action="skills.evaluate",
+        target=f"/skills/{slug}/evaluate",
+        result="completed",
+        correlation_id=get_correlation_id(request),
+    )
     return {
         "skill_slug": result.skill_slug,
         "score": result.score,
@@ -65,11 +94,22 @@ async def evaluate_skill(slug: str):
 
 
 @router.delete("/{slug}")
-async def delete_skill(slug: str):
+async def delete_skill(
+    slug: str,
+    request: Request,
+    principal: Principal = Depends(require_admin),
+):
     from pathlib import Path
     import shutil
     skill_path = Path("skills") / slug
     if not skill_path.exists():
         raise HTTPException(status_code=404, detail="Skill not found")
     shutil.rmtree(skill_path)
+    log_audit_event(
+        principal=principal,
+        action="skills.delete",
+        target=f"/skills/{slug}",
+        result="deleted",
+        correlation_id=get_correlation_id(request),
+    )
     return {"status": "deleted", "slug": slug}

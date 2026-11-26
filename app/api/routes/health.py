@@ -1,4 +1,6 @@
-from fastapi import APIRouter
+from fastapi import APIRouter, Depends
+
+from app.security.api_auth import require_service_or_admin
 
 router = APIRouter(tags=["health"])
 
@@ -8,7 +10,7 @@ async def health():
     return {"status": "ok", "service": "girivinity"}
 
 
-@router.get("/health/deep")
+@router.get("/health/deep", dependencies=[Depends(require_service_or_admin)])
 async def health_deep():
     """Checks that ChromaDB and embedder are reachable."""
     issues = []
@@ -43,8 +45,28 @@ async def health_deep():
             "error": str(exc),
         }
 
+    model_status: dict[str, object] = {
+        "native_model_path": None,
+        "checkpoint_present": False,
+        "trained_context_verified": False,
+    }
+    try:
+        from pathlib import Path
+        import yaml
+
+        cfg = yaml.safe_load(Path("config.yaml").read_text(encoding="utf-8"))
+        native_path = cfg.get("model", {}).get("native_model_path", "models/base/final")
+        ckpt_file = Path(native_path) / "model.pt"
+        model_status["native_model_path"] = native_path
+        model_status["checkpoint_present"] = ckpt_file.exists()
+        arch = cfg.get("model", {}).get("architecture", {})
+        model_status["configured_max_seq_len"] = arch.get("max_seq_len")
+    except Exception as exc:
+        model_status["error"] = str(exc)
+
     return {
         "status": "ok" if not issues else "degraded",
         "issues": issues,
         "compute": compute,
+        "model_status": model_status,
     }

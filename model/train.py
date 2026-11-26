@@ -112,6 +112,7 @@ def train(
                 y.view(-1),
                 ignore_index=-100,
             )
+            # Accumulate scaled loss
             (loss / grad_accum).backward()
 
             if step % grad_accum == 0:
@@ -138,6 +139,18 @@ def train(
                 ckpt.mkdir(exist_ok=True)
                 torch.save(model.state_dict(), ckpt / "model.pt")
                 logger.info("Checkpoint saved to %s", ckpt)
+
+        # Flush any remaining unstepped accumulated gradients at end of epoch
+        remainder = len(loader) % grad_accum
+        if remainder != 0:
+            # Rescale gradients that were scaled by 1/grad_accum to be weighted properly for remainder
+            for p in model.parameters():
+                if p.grad is not None:
+                    p.grad.data.mul_(grad_accum / remainder)
+            nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimiser.step()
+            scheduler.step()
+            optimiser.zero_grad()
 
         avg_loss = total_loss / len(loader)
         logger.info("Epoch %d complete — avg loss: %.4f", epoch, avg_loss)
