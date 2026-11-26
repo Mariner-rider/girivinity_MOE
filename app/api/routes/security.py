@@ -1,7 +1,14 @@
 from __future__ import annotations
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Header, HTTPException
+
+from app.security.api_auth import verify_admin_token
 
 router = APIRouter(prefix="/security", tags=["security"])
+
+
+def _require_admin(x_admin_key: str | None = Header(default=None, alias="X-Admin-Key")) -> None:
+    if not verify_admin_token(x_admin_key):
+        raise HTTPException(status_code=401, detail="Unauthorized: Valid X-Admin-Key required")
 
 
 @router.get("/status")
@@ -48,7 +55,8 @@ async def recent_events(limit: int = 50):
 
 
 @router.post("/mode/{mode}")
-async def set_security_mode(mode: str):
+async def set_security_mode(mode: str, x_admin_key: str | None = Header(default=None, alias="X-Admin-Key")):
+    _require_admin(x_admin_key)
     from app.security.policy_engine import SecurityMode
     valid = [m.value for m in SecurityMode]
     if mode not in valid:
@@ -76,7 +84,8 @@ async def set_security_mode(mode: str):
 
 
 @router.post("/emergency/resolve")
-async def resolve_emergency():
+async def resolve_emergency(x_admin_key: str | None = Header(default=None, alias="X-Admin-Key")):
+    _require_admin(x_admin_key)
     from app.core import db
     db.execute(
         "INSERT INTO system_security_mode "

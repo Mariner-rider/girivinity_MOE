@@ -8,13 +8,19 @@ from app.security.api_auth import Principal, get_correlation_id, log_audit_event
 router = APIRouter(prefix="/admin", tags=["admin"], dependencies=[Depends(require_admin)])
 
 
+def _require_admin(x_admin_key: str | None = Header(default=None, alias="X-Admin-Key")) -> None:
+    if not verify_admin_token(x_admin_key):
+        raise HTTPException(status_code=401, detail="Unauthorized: Valid X-Admin-Key required")
+
+
 class FeedbackRequest(BaseModel):
     user_id: str
     score: float
 
 
 @router.get("/notifications")
-async def get_notifications():
+async def get_notifications(x_admin_key: str | None = Header(default=None, alias="X-Admin-Key")):
+    _require_admin(x_admin_key)
     return {"notifications": SuccessorEngine().get_notifications()}
 
 
@@ -49,7 +55,8 @@ async def reject_successor(version: str, request: Request, principal: Principal 
 
 
 @router.get("/model-versions")
-async def list_model_versions():
+async def list_model_versions(x_admin_key: str | None = Header(default=None, alias="X-Admin-Key")):
+    _require_admin(x_admin_key)
     from pathlib import Path
     import yaml
     cfg = yaml.safe_load(Path("config.yaml").read_text())

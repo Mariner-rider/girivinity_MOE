@@ -42,6 +42,8 @@ class PretrainConfig:
     device: str = "auto"
 
     def __post_init__(self) -> None:
+        if self.train_seq_len <= 0:
+            self.train_seq_len = min(4096, self.model_config.max_seq_len)
         if self.batch_size < 1:
             raise ValueError("batch_size must be at least 1")
         if self.learning_rate <= 0:
@@ -175,6 +177,11 @@ class GirivinityPretrainer:
         self.model.gradient_checkpointing_enable()
         self.model.to(self.device)
         self._wrap_fsdp_if_requested()
+        logger.info(
+            "GirivinityPretrainer initialized: max_seq_len=%d, train_seq_len=%d",
+            config.model_config.max_seq_len,
+            config.train_seq_len,
+        )
 
         self.train_loader: DataLoader | None = None
         self.val_loader: DataLoader | None = None
@@ -368,40 +375,51 @@ class GirivinityPretrainer:
     def _training_step(self, batch: dict[str, Tensor], amp_enabled: bool) -> tuple[Tensor, int]:
         input_ids = batch["input_ids"].to(self.device, non_blocking=True)
         labels = batch["labels"].to(self.device, non_blocking=True)
+
         with torch.cuda.amp.autocast(enabled=amp_enabled):
             output = self.model(input_ids)
+
             if len(output) == 3:
                 # MTP-enabled model: forward() returns
                 # (main_logits, mtp_logits_list, kv_caches).
                 main_logits, mtp_logits_list, _ = output
+
                 loss = F.cross_entropy(
                     main_logits.reshape(-1, main_logits.size(-1)),
                     labels.reshape(-1),
                 )
+
                 mtp_weight = getattr(self.model, "cfg", None)
                 weight = mtp_weight.mtp_loss_weight if mtp_weight is not None else 0.3
+
                 for depth, mtp_logits in enumerate(mtp_logits_list, start=1):
                     if mtp_logits.size(1) <= depth:
-                        # Sequence too short for this depth's shift to
+                        # Se    nce too short for this depth's shift to
                         # produce any positions; skip rather than compute
                         # cross-entropy over an empty tensor (which can
                         # silently yield nan instead of raising).
                         continue
+
                     shifted_logits = mtp_logits[:, :-depth, :]
                     shifted_labels = labels[:, depth:]
+
                     loss = loss + weight * F.cross_entropy(
                         shifted_logits.reshape(-1, shifted_logits.size(-1)),
                         shifted_labels.reshape(-1),
                     )
+
             else:
                 logits, _ = output
+
                 loss = F.cross_entropy(
                     logits.reshape(-1, logits.size(-1)),
                     labels.reshape(-1),
                 )
-            # Router z-loss needs NO code here: it is injected inside
-            # GirivinityModel.forward (value-neutral gradient patch) so it
-            # works with the gradient checkpointing enabled above.
+
+                # Router z-loss needs NO code here: it is injected inside
+                # GirivinityModel.forward (value-neutral gradient patch) so
+                # it works with the gradient checkpointing enabled above.
+
         return loss, labels.numel()
 
     def _loader_loss(self, loader: DataLoader) -> float:

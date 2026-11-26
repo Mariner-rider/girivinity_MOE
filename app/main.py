@@ -49,13 +49,22 @@ async def lifespan(_: FastAPI):
     except RuntimeError:
         pass  # already set (spawn re-imports the app)
     global _self_trainer_process
-    _self_trainer_process = SelfTrainer.start()   # exactly once
-    SuccessorEngine.start()                        # exactly once
+    _self_trainer_process = SelfTrainer.start()   # starts if enabled
+    SuccessorEngine.start()                        # starts if enabled
     from app.core.cuda_crawler import CUDACrawler
     CUDACrawler().bootstrap_async()
     if settings.auto_load_model:
         _llm_runtime["runtime"] = GirivinityLoader().get_model()
     yield
+    # Clean shutdown of workers and runtime
+    try:
+        SelfTrainer.stop()
+    except Exception as exc:
+        logger.warning("Error stopping SelfTrainer: %s", exc)
+    try:
+        SuccessorEngine.stop()
+    except Exception as exc:
+        logger.warning("Error stopping SuccessorEngine: %s", exc)
     _llm_runtime.clear()
 
 
@@ -229,11 +238,23 @@ async def v1_system_status():
         rag_docs = col.count()
     except Exception:
         pass
+
+    param_profile = "unknown"
+    try:
+        from model.architecture import GirivinityConfig
+        cfg = GirivinityConfig.from_yaml()
+        counts = cfg.count_parameters()
+        total_b = counts["total_parameters"] / 1e9
+        active_b = counts["active_parameters"] / 1e9
+        param_profile = f"{total_b:.1f}B ({active_b:.1f}B active)"
+    except Exception:
+        pass
+
     return {
         "model_loaded": "runtime" in _llm_runtime,
         "backend": "girivinity",
         "current_generation": 1,
-        "parameter_scale": "3B",
+        "parameter_scale": param_profile,
         "rag_docs": rag_docs,
         "training_queue_size": queue_size,
         "last_training_cycle": last_cycle,
