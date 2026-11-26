@@ -41,7 +41,7 @@ model:
   trust_remote_code: false
   attn_implementation: "flash_attention_2"
 
-  # Architecture (3B spec, matches model/architecture.py's verified defaults)
+  # Architecture (~5.8B total / ~2.7B active MoE spec; config-derived parameter scale)
   architecture:
     vocab_size: 65536
     max_seq_len: 32768
