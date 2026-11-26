@@ -56,14 +56,50 @@ class SuccessorEngine:
         self.quant_type = str(se.get("quant_type", "Q4_K_M"))
         self.generation_policy = GenerationPolicy()
 
+    _process: multiprocessing.Process | None = None
+
     @classmethod
-    def start(cls) -> multiprocessing.Process:
+    def start(cls) -> multiprocessing.Process | None:
+        cfg = yaml.safe_load(Path("config.yaml").read_text())
+        feature_flags = cfg.get("feature_flags", {})
+        if not feature_flags.get("enable_successor_engine", True):
+            logger.info("SuccessorEngine disabled by feature flags; skipping startup")
+            return None
+
+        if cls._process is not None and cls._process.is_alive():
+            logger.info("SuccessorEngine daemon is already running (PID=%s)", cls._process.pid)
+            return cls._process
+
         instance = cls()
         p = multiprocessing.Process(target=instance._run_daemon, daemon=True)
         p.start()
-        Path(".successor_engine.pid").write_text(str(p.pid))
+        cls._process = p
+        try:
+            Path(".successor_engine.pid").write_text(str(p.pid))
+        except Exception as e:
+            logger.warning("Could not write .successor_engine.pid: %s", e)
         logger.info("SuccessorEngine daemon started PID=%s", p.pid)
         return p
+
+    @classmethod
+    def stop(cls, timeout: float = 5.0) -> None:
+        """Stop and terminate the daemon process safely."""
+        pid_file = Path(".successor_engine.pid")
+        if pid_file.exists():
+            try:
+                pid_file.unlink()
+            except Exception:
+                pass
+
+        if cls._process is not None:
+            if cls._process.is_alive():
+                logger.info("Stopping SuccessorEngine daemon (PID=%s)...", cls._process.pid)
+                cls._process.terminate()
+                cls._process.join(timeout=timeout)
+                if cls._process.is_alive():
+                    cls._process.kill()
+                    cls._process.join(timeout=1.0)
+            cls._process = None
 
     def log_feedback(self, user_id: str, score: float) -> None:
         """Called from chat endpoint when user rates a response (1-5)."""

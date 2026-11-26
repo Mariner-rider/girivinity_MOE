@@ -115,6 +115,98 @@ class GirivinityConfig:
         if self.mtp_enabled and self.n_mtp_heads < 1:
             raise ValueError("mtp_enabled requires n_mtp_heads >= 1")
 
+    def count_parameters(self) -> dict[str, int]:
+        """Allocation-free parameter-count routine calculated from formulas.
+        
+        Returns total parameters and active parameters per token.
+        """
+        # Embeddings & LM Head (tied weights)
+        # Note: self.lm_head.weight is tied to self.embed.weight
+        embed_params = self.vocab_size * self.dim
+
+        # Per-layer Attention params
+        if self.mla_enabled:
+            d_c = self.mla_d_c or (self.head_dim // 2)
+            d_c_q = self.mla_d_c_q or d_c
+            rope_dim = self.mla_rope_head_dim or (self.head_dim // 2)
+            # w_dq, w_dkv, w_kr
+            down_proj = self.dim * d_c_q + self.dim * d_c + self.dim * rope_dim
+            # w_uq, w_qr, w_uk, w_uv
+            up_proj = (d_c_q * (self.n_heads * self.head_dim) +
+                       d_c_q * (self.n_heads * rope_dim) +
+                       d_c * (self.n_kv_heads * self.head_dim) +
+                       d_c * (self.n_kv_heads * self.head_dim))
+            o_proj = (self.n_heads * self.head_dim) * self.dim
+            attn_layer_params = down_proj + up_proj + o_proj
+        else:
+            # GQA: q_proj, k_proj, v_proj, o_proj
+            q_p = self.dim * (self.n_heads * self.head_dim)
+            k_p = self.dim * (self.n_kv_heads * self.head_dim)
+            v_p = self.dim * (self.n_kv_heads * self.head_dim)
+            o_p = (self.n_heads * self.head_dim) * self.dim
+            attn_layer_params = q_p + k_p + v_p + o_p
+            if self.qk_norm_enabled:
+                attn_layer_params += 2 * self.head_dim
+
+        # Attention RMSNorm (input norm)
+        attn_norm_params = self.dim
+
+        # FFN params
+        # Standard SwiGLU: gate (dim*ffn_dim) + up (dim*ffn_dim) + down (ffn_dim*dim)
+        dense_ffn_params = 3 * self.dim * self.ffn_dim
+        ffn_norm_params = self.dim
+
+        total_dense_layer = attn_layer_params + attn_norm_params + dense_ffn_params + ffn_norm_params
+
+        # MoE Layer calculation
+        if self.moe_enabled:
+            moe_start = self.moe_start_layer if self.moe_start_layer is not None else 1
+            n_routed = self.n_routed_experts or 16
+            n_shared = self.n_shared_experts or 2
+            n_active_routed = self.n_activated_experts or 4
+            inter = self.moe_intermediate_size or (self.ffn_dim // 4)
+
+            # Expert params: gate, up, down
+            expert_params = 3 * self.dim * inter
+            # Router: gate linear (dim -> n_routed) + routing_bias (n_routed)
+            router_params = self.dim * n_routed + n_routed
+            # Total MoE FFN layer params
+            moe_ffn_total = router_params + (n_routed + n_shared) * expert_params
+            # Active MoE FFN layer params per token
+            moe_ffn_active = router_params + (n_active_routed + n_shared) * expert_params
+
+            moe_layer_total = attn_layer_params + attn_norm_params + moe_ffn_total + ffn_norm_params
+            moe_layer_active = attn_layer_params + attn_norm_params + moe_ffn_active + ffn_norm_params
+
+            dense_layers = min(moe_start, self.n_layers)
+            moe_layers = max(0, self.n_layers - dense_layers)
+
+            total_layers_params = (dense_layers * total_dense_layer) + (moe_layers * moe_layer_total)
+            active_layers_params = (dense_layers * total_dense_layer) + (moe_layers * moe_layer_active)
+        else:
+            total_layers_params = self.n_layers * total_dense_layer
+            active_layers_params = total_layers_params
+
+        # Final norm
+        final_norm_params = self.dim
+
+        # Optional extras
+        extra_params = 0
+        if self.ple_enabled and self.ple_dim:
+            # PerLayerEmbedding: embed (vocab_size * ple_dim) + proj (ple_dim * dim * n_layers)
+            extra_params += self.vocab_size * self.ple_dim + (self.ple_dim * self.dim * self.n_layers)
+        if self.mhc_enabled and self.n_residual_streams:
+            extra_params += self.n_residual_streams * self.n_residual_streams
+
+        total = embed_params + total_layers_params + final_norm_params + extra_params
+        active = embed_params + active_layers_params + final_norm_params + extra_params
+
+        return {
+            "total_parameters": total,
+            "active_parameters": active,
+            "embed_parameters": embed_params,
+        }
+
     @property
     def head_dim(self) -> int:
         return self.dim // self.n_heads

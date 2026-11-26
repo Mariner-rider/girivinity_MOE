@@ -58,15 +58,52 @@ class SelfTrainer:
                     ],
                 )
 
+    _process: multiprocessing.Process | None = None
+
     @classmethod
-    def start(cls) -> multiprocessing.Process:
-        """Launch the daemon process. Call once at FastAPI startup."""
+    def start(cls) -> multiprocessing.Process | None:
+        """Launch the daemon process if enabled in configuration."""
+        cfg = yaml.safe_load(Path("config.yaml").read_text())
+        feature_flags = cfg.get("feature_flags", {})
+        modules_training = (cfg.get("modules", {}).get("training", {}) or {}).get("enabled", True)
+        if not (feature_flags.get("enable_training", True) and modules_training):
+            logger.info("SelfTrainer disabled by feature flags; skipping startup")
+            return None
+
+        if cls._process is not None and cls._process.is_alive():
+            logger.info("SelfTrainer daemon is already running (PID=%s)", cls._process.pid)
+            return cls._process
+
         instance = cls()
         p = multiprocessing.Process(target=instance._run_daemon, daemon=True)
         p.start()
-        Path(".self_trainer.pid").write_text(str(p.pid))
+        cls._process = p
+        try:
+            Path(".self_trainer.pid").write_text(str(p.pid))
+        except Exception as e:
+            logger.warning("Could not write .self_trainer.pid: %s", e)
         logger.info("SelfTrainer daemon started PID=%s", p.pid)
         return p
+
+    @classmethod
+    def stop(cls, timeout: float = 5.0) -> None:
+        """Stop and terminate the daemon process safely."""
+        pid_file = Path(".self_trainer.pid")
+        if pid_file.exists():
+            try:
+                pid_file.unlink()
+            except Exception:
+                pass
+
+        if cls._process is not None:
+            if cls._process.is_alive():
+                logger.info("Stopping SelfTrainer daemon (PID=%s)...", cls._process.pid)
+                cls._process.terminate()
+                cls._process.join(timeout=timeout)
+                if cls._process.is_alive():
+                    cls._process.kill()
+                    cls._process.join(timeout=1.0)
+            cls._process = None
 
     def _run_daemon(self) -> None:
         logger.info("SelfTrainer running, interval=%ds", self.interval_s)
