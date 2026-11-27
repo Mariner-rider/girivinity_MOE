@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import logging
 import time
+from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any
 
 from llm_loader import GirivinityLoader, LLMEngineConfig
 
@@ -65,7 +66,7 @@ class LLMEngine:
 
             gpus = GPUtil.getGPUs()
             has_gpu_vram = any(getattr(g, "memoryTotal", 0) >= 4096 for g in gpus)
-        except Exception:
+        except (ImportError, AttributeError, RuntimeError, ValueError, OSError):
             has_gpu_vram = False
         gguf_path = str(getattr(config, "gguf_path", "") or getattr(config, "quantised_path", "") or "")
         has_gguf = bool(gguf_path and Path(gguf_path).exists())
@@ -75,7 +76,7 @@ class LLMEngine:
             return "transformers"
         return "llama_cpp" if has_gguf else "transformers"
 
-    def load(self) -> "LLMEngine":
+    def load(self) -> LLMEngine:
         # A native GirivinityModel only exists as PyTorch weights — it must
         # never be routed to the llama_cpp/GGUF backend, even when a GGUF
         # file happens to exist on the machine.
@@ -88,7 +89,7 @@ class LLMEngine:
             return self._load_llama_cpp()
         return self._load_transformers()
 
-    def _load_transformers(self) -> "LLMEngine":
+    def _load_transformers(self) -> LLMEngine:
         loaded = self._loader.load()
         self.model = loaded.model
         self.tokenizer = loaded.tokenizer
@@ -97,10 +98,10 @@ class LLMEngine:
         self._loaded = True
         return self
 
-    def _load_llama_cpp(self) -> "LLMEngine":
+    def _load_llama_cpp(self) -> LLMEngine:
         try:
             from llama_cpp import Llama
-        except Exception as exc:
+        except (ImportError, OSError, RuntimeError) as exc:
             logger.warning("llama_cpp backend requested but unavailable; falling back to transformers: %s", exc)
             self._active_backend = "transformers"
             return self._load_transformers()
@@ -133,7 +134,7 @@ class LLMEngine:
                     "gpu_vram_free_gb": round(torch.cuda.mem_get_info()[0] / 1e9, 1),
                     "inference_mode": "4bit_nf4_gpu",
                 }
-        except Exception as exc:
+        except (ImportError, RuntimeError, OSError, AttributeError) as exc:
             logger.debug("Unable to read CUDA device info: %s", exc)
         return {
             "device": "cpu",
@@ -262,9 +263,10 @@ class LLMEngine:
                 probs = torch.softmax(logits.float(), dim=-1)
                 entropy = -(probs * (probs + 1e-9).log()).sum().item()
                 return float(entropy)
-            except Exception:
-                pass
-        import math, re
+            except (ImportError, RuntimeError, AttributeError, ValueError, TypeError) as exc:
+                logger.debug("Logit entropy unavailable, falling back to lexical entropy: %s", exc)
+        import math
+        import re
 
         tokens = re.findall(r"[A-Za-z0-9_]+", (sample or "").lower())
         if not tokens:
@@ -286,7 +288,7 @@ class LLMEngine:
             from app.cognition.calibration import CalibrationManager
 
             return CalibrationManager.from_config().calibrate(raw, agent_name)
-        except Exception:
+        except (ImportError, RuntimeError, ValueError, TypeError, OSError):
             return round(min(1.0, max(0.0, raw)), 3)
 
     def _move_inputs_to_model_device(self, encoded: dict[str, Any]) -> dict[str, Any]:
@@ -318,7 +320,7 @@ class LLMEngine:
             model_device = self._model_device()
             self.used_gpu = bool(model_device and str(model_device).startswith("cuda"))
             self.device = "cuda" if self.used_gpu else "cpu"
-        except Exception as exc:
+        except (ImportError, RuntimeError, AttributeError, OSError) as exc:
             logger.debug("Model device configuration failed; using CPU metadata: %s", exc)
             self.used_gpu = False
             self.device = "cpu"
@@ -331,7 +333,7 @@ class LLMEngine:
             return device
         try:
             return next(self.model.parameters()).device
-        except Exception:
+        except (StopIteration, AttributeError, RuntimeError):
             return None
 
     @staticmethod
@@ -343,7 +345,7 @@ class LLMEngine:
 
             cfg = yaml.safe_load(Path("config.yaml").read_text(encoding="utf-8")) or {}
             return str((cfg.get("compute", {}) or {}).get("device", "auto"))
-        except Exception:
+        except (OSError, ValueError, TypeError, ImportError, AttributeError):
             return "auto"
 
     @staticmethod
@@ -352,7 +354,7 @@ class LLMEngine:
             import torch
 
             return torch.cuda.is_available()
-        except Exception:
+        except (ImportError, RuntimeError, AttributeError):
             return False
 
     def _ensure_loaded(self) -> None:

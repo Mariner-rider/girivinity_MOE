@@ -45,12 +45,12 @@ class SelfImprovementLoop:
         self._init_db()
 
     @classmethod
-    def from_config(cls, path: str = "config.yaml") -> "SelfImprovementLoop":
+    def from_config(cls, path: str = "config.yaml") -> SelfImprovementLoop:
         cfg = yaml.safe_load(Path(path).read_text(encoding="utf-8")) or {}
+        from app.finetune.lora_trainer import LoRATrainer, LoRATrainingConfig
+        from app.rag.rag_engine import RAGEngine
         from crawler_engine.engine import CrawlerEngine
         from knowledge_distillation_engine import KnowledgeDistillationSystem
-        from app.rag.rag_engine import RAGEngine
-        from app.finetune.lora_trainer import LoRATrainer, LoRATrainingConfig
         from llm_engine import LLMEngine
         tr = cfg.get("training", {}) or {}
         trainer = LoRATrainer(LoRATrainingConfig(tr.get("model_id", cfg.get("model", {}).get("model_id", "sshleifer/tiny-gpt2")), tr.get("dataset_path", "data/distillation/output.jsonl"), tr.get("output_dir", "models/adapters/cycle"), tr.get("validation_dataset_path", tr.get("dataset_path", "data/distillation/output.jsonl"))))
@@ -121,7 +121,7 @@ class SelfImprovementLoop:
                 result.perplexity_before = metrics["perplexity_before"]; result.perplexity_after = metrics["perplexity_after"]; result.perplexity_delta = metrics["perplexity_delta"]
                 self._hot_swap_adapter(result.adapter_path)
             result.success = True
-        except Exception as exc:
+        except (OSError, RuntimeError, ValueError, TypeError, KeyError, sqlite3.Error) as exc:
             result.error = str(exc); self._notify_admin(f"Self-improvement cycle failed: {exc}")
         result.finished_at = time.time(); self._log_cycle(result)
         return result

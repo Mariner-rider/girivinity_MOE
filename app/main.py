@@ -1,25 +1,34 @@
+import json as _json
 import logging
+import time as _time
+import uuid
 from contextlib import asynccontextmanager
-from typing import Any
+from pathlib import Path
+from typing import Annotated, Any
 
-from fastapi import FastAPI, Header, HTTPException, Request
-from fastapi.responses import JSONResponse, Response
+from fastapi import Body, FastAPI, File, Form, Header, HTTPException, Query, Request, UploadFile
+from fastapi.responses import JSONResponse, PlainTextResponse, Response, StreamingResponse
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 
-from app.core.config import get_settings
-from app.core.system_config import REQUIRED_MODULES, get_system_config
-from llm_loader import GirivinityLoader
-from app.monitoring.logging import configure_logging
-from app.monitoring.metrics import REQUEST_COUNTER
-from app.core.self_trainer import SelfTrainer
-from app.core.successor_engine import SuccessorEngine
 from app.api.routes.admin import router as admin_router
 from app.api.routes.chat import router as chat_router
+from app.api.routes.cuda import router as cuda_router
 from app.api.routes.health import router as health_router
 from app.api.routes.skills import router as skills_router
-from app.api.routes.cuda import router as cuda_router
+from app.core.config import get_settings
+from app.core.self_trainer import SelfTrainer
+from app.core.successor_engine import SuccessorEngine
+from app.core.system_config import REQUIRED_MODULES, get_system_config
+from app.monitoring.logging import configure_logging
+from app.monitoring.metrics import REQUEST_COUNTER
 from app.security.rasp import RASPEngine
 from app.security.rasp_api import rasp_router
+from llm_loader import GirivinityLoader
+
+try:
+    from app.engines.user_behavior_engine import FeedbackHarvester
+except (ImportError, RuntimeError, OSError):
+    FeedbackHarvester = None  # type: ignore
 
 logger = logging.getLogger(__name__)
 
@@ -50,11 +59,11 @@ async def lifespan(_: FastAPI):
     # Clean shutdown of workers and runtime
     try:
         SelfTrainer.stop()
-    except Exception as exc:
+    except (RuntimeError, OSError, ValueError, AttributeError) as exc:
         logger.warning("Error stopping SelfTrainer: %s", exc)
     try:
         SuccessorEngine.stop()
-    except Exception as exc:
+    except (RuntimeError, OSError, ValueError, AttributeError) as exc:
         logger.warning("Error stopping SuccessorEngine: %s", exc)
     _llm_runtime.clear()
 
@@ -105,17 +114,6 @@ def metrics() -> Response:
 
 
 # --- v1 production endpoints -------------------------------------------------
-import json as _json
-import time as _time
-from fastapi import UploadFile, File, Form, Body
-from fastapi.responses import StreamingResponse, PlainTextResponse
-
-try:
-    from app.engines.user_behavior_engine import FeedbackHarvester
-except Exception:
-    FeedbackHarvester = None  # type: ignore
-
-
 def _ndjson_stream(text: str):
     for token in text.split(" "):
         yield _json.dumps({"token": token + " ", "done": False}) + "\n"
@@ -123,37 +121,49 @@ def _ndjson_stream(text: str):
 
 
 @app.post("/v1/chat")
-async def v1_chat(text: str = Form(...), image: UploadFile | None = File(None), audio: UploadFile | None = File(None), video: UploadFile | None = File(None), user_id: str | None = Form(None)):
+async def v1_chat(
+    text: Annotated[str, Form()],
+    image: Annotated[UploadFile | None, File()] = None,
+    audio: Annotated[UploadFile | None, File()] = None,
+    video: Annotated[UploadFile | None, File()] = None,
+    user_id: Annotated[str | None, Form()] = None,
+):
     from app.cognition.sentiment_engine import SentimentEngine
+
     sentiment = SentimentEngine().analyze(text)
     crisis = bool(getattr(sentiment, "crisis_signal", False) if not isinstance(sentiment, dict) else sentiment.get("crisis_signal"))
     prefix = "I’m here with you. If you may be in immediate danger, contact local emergency services or a trusted person now. " if crisis else ""
+    chat_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
+    created = int(_time.time())
     try:
         from agent_controller import AgentController
+
         controller = AgentController()
         output = controller.execute(text, user_id=user_id) if hasattr(controller, "execute") else str(controller.run(text))
-    except Exception as exc:
-            logger.error("v1 chat failed: %s", exc)
-            return {
-                "id": chat_id,
-                "object": "chat.completion",
-                "created": created,
-                "model": "girivinity",
-                "choices": [
-                    {
-                        "message": {
-                            "role": "assistant",
-                            "content": "I'm unable to process that request right now. Please try again.",
-                        },
-                        "finish_reason": "error",
-                        "index": 0,
-                    }
-                ],
-                "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
-            }
+    except (RuntimeError, ValueError, TypeError, KeyError, OSError, AttributeError, ImportError) as exc:
+        logger.error("v1 chat failed: %s", exc)
+        return {
+            "id": chat_id,
+            "object": "chat.completion",
+            "created": created,
+            "model": "girivinity",
+            "choices": [
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": "I'm unable to process that request right now. Please try again.",
+                    },
+                    "finish_reason": "error",
+                    "index": 0,
+                }
+            ],
+            "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+        }
+    return StreamingResponse(_ndjson_stream(prefix + str(output)), media_type="application/x-ndjson")
+
 
 @app.post("/v1/analyze/code")
-async def v1_analyze_code(payload: dict = Body(...)):
+async def v1_analyze_code(payload: Annotated[dict, Body()]):
     code = payload.get("code", "")
     findings = []
     if "eval(" in code or "exec(" in code: findings.append({"type": "dangerous-eval", "severity": "high"})
@@ -163,10 +173,10 @@ async def v1_analyze_code(payload: dict = Body(...)):
 
 
 @app.post("/v1/analyze/threat")
-async def v1_analyze_threat(payload: dict = Body(...)):
+async def v1_analyze_threat(payload: Annotated[dict, Body()]):
     import re
     text = payload.get("text", "")
-    cves = re.findall(r"CVE-\d{4}-\d{4,}", text, re.I)
+    cves = re.findall(r"CVE-\d{4}-\d{4,}", text, re.IGNORECASE)
     iocs = re.findall(r"\b(?:\d{1,3}\.){3}\d{1,3}\b|\b[a-fA-F0-9]{32,64}\b", text) if payload.get("include_ioc", True) else []
     techniques = re.findall(r"T\d{4}(?:\.\d{3})?", text)
     risk = min(1.0, 0.2 + 0.2 * len(cves) + 0.1 * len(iocs) + 0.2 * len(techniques))
@@ -179,7 +189,7 @@ async def v1_cve(cve_id: str):
 
 
 @app.post("/v1/cve/search")
-async def v1_cve_search(payload: dict = Body(...)):
+async def v1_cve_search(payload: Annotated[dict, Body()]):
     return {
         "results": [],
         "keyword": payload.get("keyword", ""),
@@ -193,7 +203,7 @@ async def v1_mitre(technique_id: str):
 
 
 @app.post("/v1/ioc/check")
-async def v1_ioc_check(payload: dict = Body(...)):
+async def v1_ioc_check(payload: Annotated[dict, Body()]):
     import re
     value = payload.get("value", "")
     vt = "hash" if re.fullmatch(r"[a-fA-F0-9]{32,64}", value) else "ip" if re.fullmatch(r"(?:\d{1,3}\.){3}\d{1,3}", value) else "url" if value.startswith(("http://", "https://")) else "domain"
@@ -207,25 +217,24 @@ async def v1_system_status():
         from app.core.db import fetchone
         row = fetchone("SELECT COUNT(*) FROM training_queue WHERE status='pending'")
         queue_size = row[0] if row else 0
-    except Exception:
-        pass
+    except (ImportError, OSError, RuntimeError, ValueError, TypeError) as exc:
+        logger.debug("Training queue status unavailable: %s", exc)
     try:
-        import json as _json
         log = Path("logs/self_training.jsonl")
         if log.exists():
-            lines = [l for l in log.read_text().splitlines() if l.strip()]
+            lines = [line for line in log.read_text().splitlines() if line.strip()]
             if lines:
                 last_cycle = _json.loads(lines[-1]).get("timestamp")
-    except Exception:
-        pass
+    except (OSError, ValueError, TypeError) as exc:
+        logger.debug("Self-training log unavailable: %s", exc)
     try:
         import chromadb
         import yaml as _yaml
         cfg = _yaml.safe_load(Path("config.yaml").read_text())
         col = chromadb.PersistentClient(path=cfg["rag"]["chroma_path"]).get_or_create_collection("girivinity_knowledge")
         rag_docs = col.count()
-    except Exception:
-        pass
+    except (ImportError, OSError, RuntimeError, ValueError, KeyError, TypeError) as exc:
+        logger.debug("RAG status unavailable: %s", exc)
 
     param_profile = "unknown"
     try:
@@ -235,8 +244,8 @@ async def v1_system_status():
         total_b = counts["total_parameters"] / 1e9
         active_b = counts["active_parameters"] / 1e9
         param_profile = f"{total_b:.1f}B ({active_b:.1f}B active)"
-    except Exception:
-        pass
+    except (ImportError, OSError, RuntimeError, ValueError, KeyError, TypeError) as exc:
+        logger.debug("Model parameter profile unavailable: %s", exc)
 
     return {
         "model_loaded": "runtime" in _llm_runtime,
@@ -277,16 +286,13 @@ async def v1_training_trigger(x_admin_key: str | None = Header(default=None, ali
 
 
 @app.post("/v1/feedback")
-async def v1_feedback(payload: dict = Body(...)):
+async def v1_feedback(payload: Annotated[dict, Body()]):
     if FeedbackHarvester is None:
         return {"stored": False, "reason": "FeedbackHarvester unavailable"}
     FeedbackHarvester().collect_explicit(payload["interaction_id"], int(payload["rating"]), payload.get("correction"), payload.get("user_id"))
     return {"stored": True}
 
 # --- adaptive agent platform endpoints --------------------------------------
-from dataclasses import asdict as _agent_asdict
-from fastapi import HTTPException, Query
-
 _adaptive_runtime: dict[str, Any] = {}
 
 
@@ -301,7 +307,11 @@ def _get_agent_registry():
 def _get_adaptive_executor():
     if "adaptive_executor" not in _adaptive_runtime:
         from agent_controller import LocalLLMEngine
-        from app.agents.adaptive_agent_executor import AdaptiveAgentExecutor, BasicToolRegistry, InMemoryRAG
+        from app.agents.adaptive_agent_executor import (
+            AdaptiveAgentExecutor,
+            BasicToolRegistry,
+            InMemoryRAG,
+        )
         from app.agents.capability_merger import CapabilityMerger
         from app.security.policy import SecurityGuard
 
@@ -326,7 +336,7 @@ async def v1_agents_search(q: str = Query(..., min_length=1)):
 
 
 @app.post("/v1/agents")
-async def v1_agents_register(payload: dict = Body(...), x_admin_key: str | None = Header(default=None, alias="X-Admin-Key")):
+async def v1_agents_register(payload: Annotated[dict, Body()], x_admin_key: str | None = Header(default=None, alias="X-Admin-Key")):
     from app.security.api_auth import verify_admin_token
     if not verify_admin_token(x_admin_key):
         raise HTTPException(status_code=401, detail="Unauthorized: Valid X-Admin-Key required to register agent definitions")
@@ -362,7 +372,7 @@ async def v1_agents_get(agent_type_id: str):
 
 
 @app.post("/v1/agents/{agent_type_id}/run")
-async def v1_agents_run(agent_type_id: str, payload: dict = Body(...)):
+async def v1_agents_run(agent_type_id: str, payload: Annotated[dict, Body()]):
     user_id = payload.get("user_id")
     task = payload.get("task")
     if not user_id or not task:
@@ -384,7 +394,7 @@ async def v1_agents_stats(agent_type_id: str):
 
 
 @app.post("/v1/agents/{agent_type_id}/feedback")
-async def v1_agents_feedback(agent_type_id: str, payload: dict = Body(...)):
+async def v1_agents_feedback(agent_type_id: str, payload: Annotated[dict, Body()]):
     registry = _get_agent_registry()
     if registry.get(agent_type_id) is None:
         raise HTTPException(status_code=404, detail=f"Unknown agent type: {agent_type_id}")

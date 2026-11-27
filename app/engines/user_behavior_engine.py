@@ -116,7 +116,7 @@ class RecommendationSystem:
         ranked = []
         user_interests = set(profile.interests)
         for item in candidates:
-            tags = set(t.lower() for t in item.get("tags", []))
+            tags = {t.lower() for t in item.get("tags", [])}
             overlap = len(user_interests & tags)
             score = overlap + (0.1 if profile.interaction_patterns.get("avg_dwell_seconds", 0) > 10 else 0)
             ranked.append((score, item))
@@ -151,7 +151,7 @@ class CognitiveProfileBuilder:
         self.theory_of_mind = theory_of_mind_engine
 
     @classmethod
-    def from_config(cls, path: str = "config.yaml") -> "CognitiveProfileBuilder":
+    def from_config(cls, path: str = "config.yaml") -> CognitiveProfileBuilder:
         guard = PrivacyGuard(require_consent=False)
         return cls(UserBehaviorTrackingSystem(guard))
 
@@ -167,8 +167,10 @@ class CognitiveProfileBuilder:
         gaps = [topic for topic in ["security", "python", "architecture", "rag"] if topic not in known]
         expertise = {}
         if self.theory_of_mind and hasattr(self.theory_of_mind, "infer"):
-            try: expertise = self.theory_of_mind.infer(text).__dict__
-            except Exception: expertise = {}
+            try:
+                expertise = self.theory_of_mind.infer(text).__dict__
+            except (AttributeError, TypeError, ValueError, RuntimeError):
+                expertise = {}
         return CognitiveProfile(profile.anonymized_user_id, learning_style, {"known_topics": known, "knowledge_gaps": gaps}, rhythm, preferred, expertise)
 
 
@@ -177,7 +179,7 @@ class PersonalisationEngine:
         self.profile_builder = profile_builder
 
     @classmethod
-    def from_config(cls, path: str = "config.yaml") -> "PersonalisationEngine":
+    def from_config(cls, path: str = "config.yaml") -> PersonalisationEngine:
         return cls(CognitiveProfileBuilder.from_config(path))
 
     def personalize_prompt(self, base_prompt: str, user_id: str) -> str:
@@ -205,20 +207,21 @@ class FeedbackHarvester:
             db.commit()
 
     @classmethod
-    def from_config(cls, path: str = "config.yaml") -> "FeedbackHarvester":
+    def from_config(cls, path: str = "config.yaml") -> FeedbackHarvester:
         return cls()
 
     def collect_explicit(self, interaction_id: str, rating: int, correction: str | None = None, user_id: str | None = None) -> None:
         self._insert(interaction_id, user_id, rating, correction, "explicit", 0.0, False, False)
 
     def collect_implicit(self, interaction_id: str, user_id: str | None = None, dwell_seconds: float = 0.0, follow_up_question: str = "", previous_question: str = "") -> None:
-        confusion = bool(re.search(r"confused|don't understand|what do you mean|clarify", follow_up_question, re.I))
+        confusion = bool(re.search(r"confused|don't understand|what do you mean|clarify", follow_up_question, re.IGNORECASE))
         repeated = bool(previous_question and follow_up_question and self._similar(previous_question, follow_up_question) > (3 / 4))
         rating = -1 if confusion or repeated else 1 if dwell_seconds > 20 else 0
         self._insert(interaction_id, user_id, rating, None, "implicit", dwell_seconds, confusion, repeated)
 
     def _insert(self, interaction_id, user_id, rating, correction, signal_type, dwell, confusion, repeated):
-        import sqlite3, time
+        import sqlite3
+        import time
         with sqlite3.connect(self.db_path) as db:
             db.execute("INSERT INTO feedback(interaction_id,user_id,rating,correction,signal_type,dwell_seconds,follow_up_confusion,repeated_question,created_at) VALUES(?,?,?,?,?,?,?,?,?)", (interaction_id, user_id, int(rating), correction, signal_type, float(dwell), int(confusion), int(repeated), time.time()))
             db.commit()
